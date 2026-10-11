@@ -11,6 +11,9 @@ not duplicated here.
 
 ## Commits
 
+- [Foxglove multi-sweep stream](2026-10-11-foxglove-multisweep-stream.md)
+  — live Foxglove point cloud and 3D boxes, with the keyframe plus nine past
+  LiDAR sweeps.
 - [BEVFusion camera–LiDAR visualization](2026-10-11-bevfusion-camera-lidar-visualization.md)
   — multi-camera inference, camera-colored LiDAR PLY export, motion and class
   visualization, radar helpers, and corrected 3D box coordinates.
