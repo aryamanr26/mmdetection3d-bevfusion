@@ -482,8 +482,8 @@ class TransFusionHead(nn.Module):
                     ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
 
                 temp_instances = InstanceData()
-                ret['bboxes'][:, 2] = ret[
-                    'bboxes'][:, 2] - ret['bboxes'][:, 5] * 0.5  # noqa: E501
+                # The bbox coder already converts gravity-center z to the
+                # bottom-center convention expected by box_type_3d.
                 temp_instances.bboxes_3d = metas[0]['box_type_3d'](
                     ret['bboxes'], box_dim=ret['bboxes'].shape[-1])
                 temp_instances.scores_3d = ret['scores']

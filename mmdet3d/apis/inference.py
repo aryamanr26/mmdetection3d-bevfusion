@@ -177,29 +177,26 @@ def inference_multi_modality_detector(model: nn.Module,
                                       imgs: Union[str, Sequence[str]],
                                       ann_file: Union[str, Sequence[str]],
                                       cam_type: str = 'CAM2'):
-    """Inference point cloud with the multi-modality detector. Now we only
-    support multi-modality detector for KITTI dataset since the multi-view
-    image loading is not supported yet in this inference function.
+    """Inference point cloud with the multi-modality detector.
 
     Args:
         model (nn.Module): The loaded detector.
         pcds (str, Sequence[str]):
             Either point cloud files or loaded point cloud.
         imgs (str, Sequence[str]):
-           Either image files or loaded images.
+           Either image files or loaded images. When ``cam_type`` is
+           ``'all'``, this should be the directory that contains the
+           multi-view images.
         ann_file (str, Sequence[str]): Annotation files.
-        cam_type (str): Image of Camera chose to infer.
-            For kitti dataset, it should be 'CAM2',
-            and for nuscenes dataset, it should be
-            'CAM_FRONT'. Defaults to 'CAM_FRONT'.
+        cam_type (str): Camera view to infer. Use a single camera name
+            for KITTI/SUNRGBD, or ``'all'`` for multi-view models such
+            as BEVFusion. Defaults to ``'CAM2'``.
 
     Returns:
         :obj:`Det3DDataSample` or list[:obj:`Det3DDataSample`]:
         If pcds is a list or tuple, the same length list type results
         will be returned, otherwise return the detection results directly.
     """
-
-    # TODO: We will support
     if isinstance(pcds, (list, tuple)):
         is_batch = True
         assert isinstance(imgs, (list, tuple))
@@ -221,35 +218,46 @@ def inference_multi_modality_detector(model: nn.Module,
 
     data = []
     for index, pcd in enumerate(pcds):
-        # get data info containing calib
-        img = imgs[index]
         data_info = data_list[index]
-        img_path = data_info['images'][cam_type]['img_path']
+        img = imgs[index]
 
-        if osp.basename(img_path) != osp.basename(img):
-            raise ValueError(f'the info file of {img_path} is not provided.')
+        if cam_type != 'all':
+            assert osp.isfile(img), f'{img} must be a file.'
+            img_path = data_info['images'][cam_type]['img_path']
+            if osp.basename(img_path) != osp.basename(img):
+                raise ValueError(
+                    f'the info file of {img_path} is not provided.')
+            data_info['images'][cam_type]['img_path'] = img
+            data_ = dict(
+                lidar_points=dict(lidar_path=pcd),
+                img_path=img,
+                box_type_3d=box_type_3d,
+                box_mode_3d=box_mode_3d)
+            if 'cam2img' in data_info['images'][cam_type]:
+                data_['cam2img'] = np.array(
+                    data_info['images'][cam_type]['cam2img'])
 
-        data_info['images'][cam_type]['img_path'] = img
-        cam2img = np.array(data_info['images'][cam_type]['cam2img'])
+            if box_mode_3d == Box3DMode.LIDAR:
+                if 'lidar2img' in data_info['images'][cam_type]:
+                    data_['lidar2img'] = np.array(
+                        data_info['images'][cam_type]['lidar2img'])
+            elif box_mode_3d == Box3DMode.DEPTH:
+                data_['depth2img'] = np.array(
+                    data_info['images'][cam_type]['depth2img'])
+        else:
+            assert osp.isdir(img), f'{img} must be a file directory'
+            for _, img_info in data_info['images'].items():
+                img_info['img_path'] = osp.join(img, img_info['img_path'])
+                assert osp.isfile(img_info['img_path']), (
+                    f'{img_info["img_path"]} does not exist.')
+            data_ = dict(
+                lidar_points=dict(lidar_path=pcd),
+                images=data_info['images'],
+                box_type_3d=box_type_3d,
+                box_mode_3d=box_mode_3d)
 
-        # TODO: check the name consistency of
-        # image file and point cloud file
-        # TODO: support multi-view image loading
-        data_ = dict(
-            lidar_points=dict(lidar_path=pcd),
-            img_path=img,
-            box_type_3d=box_type_3d,
-            box_mode_3d=box_mode_3d,
-            cam2img=cam2img)
-
-        # LiDAR to image conversion for KITTI dataset
-        if box_mode_3d == Box3DMode.LIDAR:
-            data_['lidar2img'] = np.array(
-                data_info['images'][cam_type]['lidar2img'])
-        # Depth to image conversion for SUNRGBD dataset
-        elif box_mode_3d == Box3DMode.DEPTH:
-            data_['depth2img'] = np.array(
-                data_info['images'][cam_type]['depth2img'])
+        if 'timestamp' in data_info:
+            data_['timestamp'] = data_info['timestamp']
 
         data_ = test_pipeline(data_)
         data.append(data_)

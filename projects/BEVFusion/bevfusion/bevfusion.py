@@ -29,6 +29,7 @@ class BEVFusion(Base3DDetector):
         bbox_head: Optional[dict] = None,
         init_cfg: OptMultiConfig = None,
         seg_head: Optional[dict] = None,
+        use_converted_checkpoint: bool = False,
         **kwargs,
     ) -> None:
         voxelize_cfg = data_preprocessor.pop('voxelize_cfg')
@@ -51,11 +52,25 @@ class BEVFusion(Base3DDetector):
         self.pts_neck = MODELS.build(pts_neck)
 
         self.bbox_head = MODELS.build(bbox_head)
-        # hard code here where using converted checkpoint of original
-        # implementation of `BEVFusion`
-        self.use_converted_checkpoint = True
+        # True only for MIT converted checkpoints (yaw / l,w remap).
+        # Official OpenMMLab C+L weights do not need this.
+        self.use_converted_checkpoint = use_converted_checkpoint
 
         self.init_weights()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Official OpenMMLab C+L checkpoints use `view_transform`.
+        # This snapshot registers the module as `vtransform`.
+        alias_from = prefix + 'view_transform.'
+        alias_to = prefix + 'vtransform.'
+        for key in list(state_dict.keys()):
+            if key.startswith(alias_from):
+                state_dict[alias_to + key[len(alias_from):]] = state_dict.pop(
+                    key)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs)
 
     def _forward(self,
                  batch_inputs: Tensor,
