@@ -6,9 +6,11 @@ camera-colored LiDAR cloud plus oriented detection boxes. Nothing is uploaded
 to Foxglove's servers: the browser pulls the stream from this machine.
 
 By default the cloud is the keyframe plus the nine previous LiDAR sweeps used
-by BEVFusion, transformed into the keyframe LiDAR frame. The first sample of a
-log has no past sweeps, so the stream steps forward to the next keyframe that
-does and runs detection there.
+by BEVFusion, transformed into the keyframe LiDAR frame. Those sweeps and the
+six camera images are read once per sample: the viewer uses the LiDAR-frame
+xyz and the original photos, and the network gets its own range-cropped and
+resized copies. The first sample of a log has no past sweeps, so the stream
+steps forward to the next keyframe that does and runs detection there.
 
 Example:
     python projects/BEVFusion/demo/foxglove_stream.py
@@ -79,15 +81,6 @@ def _resolve_images(ann_path, img_dir):
     return resolved, lidar2img
 
 
-def _load_bin_xyz(path):
-    raw = np.fromfile(path, dtype=np.float32)
-    if raw.size % 5 == 0:
-        return raw.reshape(-1, 5)[:, :3]
-    if raw.size % 4 == 0:
-        return raw.reshape(-1, 4)[:, :3]
-    return raw.reshape(-1, 3)
-
-
 def _existing_lidar_path(path):
     if path and os.path.exists(path):
         return path
@@ -101,36 +94,216 @@ def _existing_lidar_path(path):
     return path
 
 
-def accumulate_sweeps(info, sweeps_num, remove_close=True):
-    """Return keyframe plus past sweeps, all in the keyframe LiDAR frame.
+# Disk loaders replaced by the shared sensor read. Later transforms still run
+# on copies, because the model crops and resizes and the viewer does not.
+_DISK_LOADERS = {
+    'BEVLoadMultiViewImageFromFiles',
+    'LoadMultiViewImageFromFiles',
+    'LoadPointsFromFile',
+    'LoadPointsFromMultiSweeps',
+}
 
-    Uses the same ``lidar2sensor`` conversion as
-    ``LoadPointsFromMultiSweeps``. ``sweeps_num`` is the number of past sweeps,
-    so 9 produces the 10-frame cloud BEVFusion detects on.
+
+class _SensorCache:
+    """Scene-level cache for raw lidar bins and static camera intrinsics.
+
+    A keyframe bin is often listed again as a sweep of a later sample, so the
+    raw array is kept until the scene has been built. Intrinsics do not change
+    across a log. Per-frame extrinsics are not cached: ``lidar2cam`` moves
+    with the vehicle. Decoded images are not kept, because each sample has its
+    own photos and they are only needed while that frame is packed.
     """
-    key_path = _existing_lidar_path(info['lidar_points']['lidar_path'])
-    clouds = [_load_bin_xyz(key_path)]
+
+    def __init__(self):
+        self.points = {}
+        self.intrinsics = {}
+        self.tail = None
+        self.num_views = 6
+        self.num_ref_frames = -1
+
+    def intrinsic(self, cam_id, cam2img):
+        cached = self.intrinsics.get(cam_id)
+        if cached is not None:
+            return cached
+        mat = np.eye(4, dtype=np.float32)
+        mat[:3, :3] = np.asarray(cam2img, dtype=np.float32)
+        self.intrinsics[cam_id] = mat
+        return mat
+
+    def bind_pipeline(self, dataset):
+        if self.tail is not None:
+            return
+        tail = []
+        for transform in dataset.pipeline.transforms:
+            name = transform.__class__.__name__
+            if name in _DISK_LOADERS:
+                if hasattr(transform, 'num_views'):
+                    self.num_views = transform.num_views
+                    self.num_ref_frames = transform.num_ref_frames
+                continue
+            tail.append(transform)
+        self.tail = tail
+
+    def release_points(self):
+        self.points.clear()
+
+
+def _cached_points(path, cache):
+    """Return one lidar bin as ``(N, 5)`` float32, reading it at most once."""
+    resolved = os.path.normpath(_existing_lidar_path(path))
+    if cache is not None and resolved in cache.points:
+        return cache.points[resolved]
+    raw = np.fromfile(resolved, dtype=np.float32)
+    if raw.size % 5 != 0:
+        raise ValueError(f'{resolved} is not packed as 5 float32 values per point')
+    points = raw.reshape(-1, 5)
+    if cache is not None:
+        cache.points[resolved] = points
+    return points
+
+
+def _load_sweep_points(info, sweeps_num, cache=None, remove_close=True):
+    """Load the keyframe and the nearest past sweeps one time.
+
+    The result is ``(N, 5)`` in the keyframe LiDAR frame: xyz, intensity, and
+    the time delta the model expects (0 on the keyframe). This is the raw
+    model cloud, before the detection range crop. Column ``:3`` is the cloud
+    to draw. ``sweeps_num`` is the number of past sweeps, so 9 is the 10-frame
+    cloud BEVFusion detects on. The nearest sweeps are kept every time.
+    """
+    key = _cached_points(info['lidar_points']['lidar_path'], cache).copy()
+    key[:, 4] = 0
+    parts = [key]
     sweeps = list(info.get('lidar_sweeps') or [])[:sweeps_num]
+    timestamp = info['timestamp']
     used = 0
     for sweep in sweeps:
         lidar = sweep.get('lidar_points') or {}
-        path = _existing_lidar_path(lidar.get('lidar_path', ''))
+        path = lidar.get('lidar_path', '')
         transform = lidar.get('lidar2sensor')
-        if not path or not os.path.exists(path) or transform is None:
+        resolved = _existing_lidar_path(path) if path else ''
+        if not resolved or not os.path.exists(resolved) or transform is None:
             continue
-        pts = _load_bin_xyz(path)
+        pts = _cached_points(path, cache).copy()
         if remove_close and len(pts):
             close = (np.abs(pts[:, 0]) < 1.0) & (np.abs(pts[:, 1]) < 1.0)
             pts = pts[~close]
-        lidar2sensor = np.asarray(transform, dtype=np.float64)
-        xyz = pts.astype(np.float64) @ lidar2sensor[:3, :3]
-        xyz -= lidar2sensor[:3, 3]
-        clouds.append(xyz.astype(np.float32))
+        # Same conversion as LoadPointsFromMultiSweeps: row vectors, then
+        # subtract the translation. Applied before any display-only step.
+        lidar2sensor = np.asarray(transform)
+        pts[:, :3] = pts[:, :3] @ lidar2sensor[:3, :3]
+        pts[:, :3] -= lidar2sensor[:3, 3]
+        pts[:, 4] = timestamp - sweep['timestamp']
+        parts.append(pts)
         used += 1
-    merged = np.concatenate(clouds, axis=0)
+    merged = np.concatenate(parts, axis=0)
     print(f'Accumulated keyframe + {used} sweeps -> {len(merged):,} points',
           flush=True)
     return merged
+
+
+def accumulate_sweeps(info, sweeps_num, remove_close=True):
+    """Return keyframe plus past sweeps, all in the keyframe LiDAR frame."""
+    merged = _load_sweep_points(
+        info, sweeps_num, cache=None, remove_close=remove_close)
+    return np.ascontiguousarray(merged[:, :3])
+
+
+def _resolve_image(cam_id, path):
+    if path and os.path.exists(path):
+        return path
+    base = os.path.basename(path or '')
+    candidate = os.path.join('data/nuscenes/samples', cam_id, base)
+    if os.path.exists(candidate):
+        return candidate
+    return path
+
+
+def _load_cameras(info, cache):
+    """Decode each camera once and build this frame's projection matrices.
+
+    Images stay at the original resolution. The model later resizes a copy.
+    Intrinsics come from the scene cache. ``lidar2cam`` is taken from this
+    sample because it is not constant over the log.
+    """
+    import mmcv
+    from mmengine.fileio import get
+
+    images, paths = [], []
+    cam2img, lidar2cam, cam2lidar, lidar2img = [], [], [], []
+    for cam_id, cam_item in info['images'].items():
+        path = _resolve_image(cam_id, cam_item['img_path'])
+        img = mmcv.imfrombytes(
+            get(path), flag='color', backend='pillow', channel_order='rgb')
+        images.append(img)
+        paths.append(path)
+        intrinsic = cache.intrinsic(cam_id, cam_item['cam2img'])
+        extrinsic = np.asarray(cam_item['lidar2cam'], dtype=np.float32)
+        rotation = extrinsic[:3, :3]
+        translation = extrinsic[:3, 3:4]
+        camera_to_lidar = np.eye(4)
+        camera_to_lidar[:3, :3] = rotation.T
+        camera_to_lidar[:3, 3:4] = -rotation.T @ translation.reshape(3, 1)
+        cam2img.append(intrinsic)
+        lidar2cam.append(extrinsic)
+        cam2lidar.append(camera_to_lidar)
+        lidar2img.append(intrinsic @ extrinsic)
+    shapes = {image.shape for image in images}
+    if len(shapes) > 1:
+        pad_h = max(image.shape[0] for image in images)
+        pad_w = max(image.shape[1] for image in images)
+        images = [
+            mmcv.impad(image, shape=(pad_h, pad_w), pad_val=0)
+            for image in images
+        ]
+    return {
+        'images': images,
+        'paths': paths,
+        'cam2img': np.stack(cam2img, axis=0),
+        'lidar2cam': np.stack(lidar2cam, axis=0),
+        'cam2lidar': np.stack(cam2lidar, axis=0),
+        'lidar2img': np.stack(lidar2img, axis=0),
+    }
+
+
+def _pack_model_inputs(dataset, info, points, cameras, cache):
+    """Run the non-loading transforms on copies of the shared sensor data.
+
+    ``points`` stays in the keyframe LiDAR frame with intensity and time.
+    The range filter crops the model copy only. Image augmentation resizes a
+    float copy and records ``img_aug_matrix``; it does not replace the
+    original ``lidar2img`` used to color the displayed cloud.
+    """
+    from mmdet3d.structures.points import LiDARPoints
+
+    cache.bind_pipeline(dataset)
+    results = info
+    results['points'] = LiDARPoints(
+        points.copy(), points_dim=points.shape[1])
+    results['img'] = [image.astype(np.float32) for image in cameras['images']]
+    results['img_path'] = list(cameras['paths'])
+    results['filename'] = results['img_path']
+    results['cam2img'] = cameras['cam2img'].copy()
+    results['ori_cam2img'] = cameras['cam2img'].copy()
+    results['lidar2cam'] = cameras['lidar2cam'].copy()
+    results['cam2lidar'] = cameras['cam2lidar'].copy()
+    results['lidar2img'] = cameras['lidar2img'].copy()
+    shape = cameras['images'][0].shape[:2]
+    results['img_shape'] = shape
+    results['ori_shape'] = shape
+    results['pad_shape'] = shape
+    results['scale_factor'] = 1.0
+    results['img_norm_cfg'] = dict(
+        mean=np.zeros(3, dtype=np.float32),
+        std=np.ones(3, dtype=np.float32),
+        to_rgb=False)
+    results['num_views'] = cache.num_views
+    results['num_ref_frames'] = cache.num_ref_frames
+    results['box_type_3d'] = dataset.box_type_3d
+    results['box_mode_3d'] = dataset.box_mode_3d
+    for transform in cache.tail:
+        results = transform(results)
+    return results
 
 
 def select_sweep_frame(data_list, lidar_name, sweeps_num):
@@ -160,53 +333,6 @@ def select_sweep_frame(data_list, lidar_name, sweeps_num):
     else:
         print(f'Using {name} (infos index {index})', flush=True)
     return index, info
-
-
-def detect_frame(infos_path, index, config, checkpoint, score_thr):
-    """Run BEVFusion and return detection dicts for ``make_scene``."""
-    import mmcv
-    import torch
-    from mmengine.config import Config
-    from mmengine.dataset import pseudo_collate
-    from mmengine.registry import init_default_scope
-    from mmdet3d.apis import init_model
-    from mmdet3d.registry import DATASETS
-
-    cfg = Config.fromfile(config)
-    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
-    model = init_model(config, checkpoint, device='cuda:0')
-    ann_file = os.path.basename(infos_path)
-    ds_cfg = cfg.test_dataloader.dataset.copy()
-    ds_cfg['ann_file'] = ann_file
-    ds_cfg['test_mode'] = True
-    ds_cfg['pipeline'] = cfg.test_dataloader.dataset.pipeline
-    dataset = DATASETS.build(ds_cfg)
-    data = dataset[index]
-    with torch.no_grad():
-        result = model.test_step(pseudo_collate([data]))[0]
-
-    pred = result.pred_instances_3d
-    keep = pred.scores_3d >= score_thr
-    labels = pred.labels_3d[keep].detach().cpu().numpy().astype(int)
-    bboxes = pred.bboxes_3d.tensor[keep].detach().cpu().numpy()
-    names = list((model.dataset_meta or {}).get('classes', CLASS_NAMES))
-    motions = classify_detections(labels, bboxes, names)
-    boxes = []
-    for label, bbox, motion in zip(labels, bboxes, motions):
-        boxes.append({
-            'label': int(label),
-            'class_name': motion['class_name'],
-            'motion': motion['motion'],
-            'bbox_3d': bbox.tolist(),
-        })
-    img_paths = result.metainfo.get('img_path', [])
-    if not isinstance(img_paths, list):
-        img_paths = [img_paths]
-    images = [
-        mmcv.imconvert(mmcv.imread(path), 'bgr', 'rgb') for path in img_paths
-    ]
-    print(f'Detections: {len(boxes)} boxes above score {score_thr}', flush=True)
-    return boxes, images, result.metainfo
 
 
 def gt_boxes_from_info(info):
@@ -255,19 +381,32 @@ def load_detector(infos_path, config, checkpoint):
     return model, dataset, names
 
 
-def infer_loaded(model, dataset, index, score_thr, class_names):
-    """Run one already-loaded sample and return boxes, images, and metadata."""
-    import mmcv
+def infer_loaded(model, dataset, index, score_thr, class_names, sweeps_num=9,
+                 cache=None):
+    """Run one sample and return boxes, original images, calibration, and xyz.
+
+    Sweeps and camera images are read once. The displayed cloud is the xyz
+    columns of that sweep cloud. Point colors are sampled from those decoded
+    images. The network receives a separate copy that is range-filtered, plus
+    resized image copies.
+    """
     import torch
     from mmengine.dataset import pseudo_collate
 
-    data = dataset[index]
-    with torch.no_grad():
-        result = model.test_step(pseudo_collate([data]))[0]
-    pred = result.pred_instances_3d
-    keep = pred.scores_3d >= score_thr
-    labels = pred.labels_3d[keep].detach().cpu().numpy().astype(int)
-    bboxes = pred.bboxes_3d.tensor[keep].detach().cpu().numpy()
+    if cache is None:
+        cache = _SensorCache()
+    info = dataset.get_data_info(index)
+    points = _load_sweep_points(info, sweeps_num, cache)
+    cameras = _load_cameras(info, cache)
+    packed = _pack_model_inputs(dataset, info, points, cameras, cache)
+    # Copy boxes to CPU inside inference mode. The .cpu() call waits until
+    # the GPU forward has finished.
+    with torch.inference_mode():
+        result = model.test_step(pseudo_collate([packed]))[0]
+        pred = result.pred_instances_3d
+        keep = pred.scores_3d >= score_thr
+        labels = pred.labels_3d[keep].detach().cpu().numpy().astype(int)
+        bboxes = pred.bboxes_3d.tensor[keep].detach().cpu().numpy()
     motions = classify_detections(labels, bboxes, class_names)
     boxes = [{
         'label': int(label),
@@ -275,13 +414,9 @@ def infer_loaded(model, dataset, index, score_thr, class_names):
         'motion': motion['motion'],
         'bbox_3d': bbox.tolist(),
     } for label, bbox, motion in zip(labels, bboxes, motions)]
-    img_paths = result.metainfo.get('img_path', [])
-    if not isinstance(img_paths, list):
-        img_paths = [img_paths]
-    images = [
-        mmcv.imconvert(mmcv.imread(path), 'bgr', 'rgb') for path in img_paths
-    ]
-    return boxes, images, result.metainfo
+    display_xyz = np.ascontiguousarray(points[:, :3])
+    meta = {'lidar2img': cameras['lidar2img'], 'img_path': cameras['paths']}
+    return boxes, cameras['images'], meta, display_xyz
 
 
 def scene_rows(data_list, lidar_name):
@@ -306,11 +441,10 @@ def _subsample(xyz, rgb, max_points):
 
 
 def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
-                         score_thr, max_points):
+                         score_thr, max_points, cache):
     """Infer one keyframe and pack synchronized Foxglove messages."""
-    xyz = accumulate_sweeps(info, sweeps_num)
-    boxes, images, meta = infer_loaded(
-        model, dataset, index, score_thr, class_names)
+    boxes, images, meta, xyz = infer_loaded(
+        model, dataset, index, score_thr, class_names, sweeps_num, cache)
     rgb = _colorize_points(xyz, images, meta)
     if rgb is None:
         rgb = np.repeat(np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None],
@@ -440,6 +574,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
           flush=True)
     model, dataset, class_names = load_detector(
         infos_path, config, checkpoint)
+    sensors = _SensorCache()
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
@@ -458,22 +593,23 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('the last frame instead of looping. Drag the timeline to seek.',
           flush=True)
 
-    cache = []
+    frames = []
     for number, (index, info, name) in enumerate(rows, 1):
         started = time.perf_counter()
         frame = build_playback_frame(
             model, dataset, class_names, info, index, sweeps_num, score_thr,
-            max_points)
-        cache.append(frame)
+            max_points, sensors)
+        frames.append(frame)
         print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
               f'{frame["predictions"]} pred, {frame["ground_truth_count"]} GT, '
               f'{time.perf_counter() - started:.1f}s', flush=True)
+    sensors.release_points()
 
     with lock:
-        player.frames = cache
+        player.frames = frames
         player.ready = True
         player.play()
-    print(f'Playing {len(cache)} frames. Pause and play from the Foxglove '
+    print(f'Playing {len(frames)} frames. Pause and play from the Foxglove '
           f'timeline.', flush=True)
 
     published = None
@@ -537,9 +673,11 @@ def load_sweep_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     with open(infos_path, 'rb') as f:
         data_list = pickle.load(f)['data_list']
     index, info = select_sweep_frame(data_list, lidar_name, sweeps_num)
-    xyz = accumulate_sweeps(info, sweeps_num)
-    boxes, images, meta = detect_frame(
-        infos_path, index, config, checkpoint, score_thr)
+    model, dataset, class_names = load_detector(
+        infos_path, config, checkpoint)
+    boxes, images, meta, xyz = infer_loaded(
+        model, dataset, index, score_thr, class_names, sweeps_num)
+    print(f'Detections: {len(boxes)} boxes above score {score_thr}', flush=True)
     rgb = _colorize_points(xyz, images, meta)
     if rgb is None:
         rgb = np.repeat(np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None],
