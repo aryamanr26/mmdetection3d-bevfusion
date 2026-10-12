@@ -22,6 +22,7 @@ import math
 import os
 import pickle
 import sys
+import threading
 import time
 
 import numpy as np
@@ -37,10 +38,14 @@ from multi_modality_demo import (  # noqa: E402
 
 import foxglove  # noqa: E402
 from foxglove.channels import PointCloudChannel, SceneUpdateChannel  # noqa: E402
+from foxglove.websocket import (  # noqa: E402
+    Capability, PlaybackCommand, PlaybackControlRequest, PlaybackState,
+    PlaybackStatus, ServerListener)
 from foxglove.messages import (  # noqa: E402
     Color, CubePrimitive, LinePrimitive, LinePrimitiveLineType,
     PackedElementField, PackedElementFieldNumericType, Point3, PointCloud,
-    Pose, Quaternion, SceneEntity, SceneUpdate, Vector3)
+    Pose, Quaternion, SceneEntity, SceneEntityDeletion,
+    SceneEntityDeletionType, SceneUpdate, TextPrimitive, Vector3)
 
 
 FRAME_ID = 'lidar'
@@ -204,6 +209,299 @@ def detect_frame(infos_path, index, config, checkpoint, score_thr):
     return boxes, images, result.metainfo
 
 
+def gt_boxes_from_info(info):
+    """Return nuScenes boxes converted to the LiDAR bottom-center convention."""
+    from mmdet3d.structures import LiDARInstance3DBoxes
+
+    rows, names = [], []
+    for obj in info.get('instances', []):
+        if not obj.get('bbox_3d_isvalid', True):
+            continue
+        label = int(obj.get('bbox_label_3d', -1))
+        if label < 0:
+            continue
+        rows.append(obj['bbox_3d'][:7])
+        names.append(CLASS_NAMES[label] if label < len(CLASS_NAMES) else str(label))
+    if not rows:
+        return []
+    converted = LiDARInstance3DBoxes(
+        np.asarray(rows, dtype=np.float32),
+        box_dim=7,
+        origin=(0.5, 0.5, 0.5),
+    )
+    boxes = []
+    for name, row in zip(names, converted.tensor.detach().cpu().numpy()):
+        boxes.append({'class_name': name, 'bbox_3d': row[:7].tolist()})
+    print(f'Ground truth: {len(boxes)} boxes', flush=True)
+    return boxes
+
+
+def load_detector(infos_path, config, checkpoint):
+    """Load BEVFusion and the nuScenes dataset once for a sequence."""
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope
+    from mmdet3d.apis import init_model
+    from mmdet3d.registry import DATASETS
+
+    cfg = Config.fromfile(config)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+    model = init_model(config, checkpoint, device='cuda:0')
+    ds_cfg = cfg.test_dataloader.dataset.copy()
+    ds_cfg['ann_file'] = os.path.basename(infos_path)
+    ds_cfg['test_mode'] = True
+    ds_cfg['pipeline'] = cfg.test_dataloader.dataset.pipeline
+    dataset = DATASETS.build(ds_cfg)
+    names = list((model.dataset_meta or {}).get('classes', CLASS_NAMES))
+    return model, dataset, names
+
+
+def infer_loaded(model, dataset, index, score_thr, class_names):
+    """Run one already-loaded sample and return boxes, images, and metadata."""
+    import mmcv
+    import torch
+    from mmengine.dataset import pseudo_collate
+
+    data = dataset[index]
+    with torch.no_grad():
+        result = model.test_step(pseudo_collate([data]))[0]
+    pred = result.pred_instances_3d
+    keep = pred.scores_3d >= score_thr
+    labels = pred.labels_3d[keep].detach().cpu().numpy().astype(int)
+    bboxes = pred.bboxes_3d.tensor[keep].detach().cpu().numpy()
+    motions = classify_detections(labels, bboxes, class_names)
+    boxes = [{
+        'label': int(label),
+        'class_name': motion['class_name'],
+        'motion': motion['motion'],
+        'bbox_3d': bbox.tolist(),
+    } for label, bbox, motion in zip(labels, bboxes, motions)]
+    img_paths = result.metainfo.get('img_path', [])
+    if not isinstance(img_paths, list):
+        img_paths = [img_paths]
+    images = [
+        mmcv.imconvert(mmcv.imread(path), 'bgr', 'rgb') for path in img_paths
+    ]
+    return boxes, images, result.metainfo
+
+
+def scene_rows(data_list, lidar_name):
+    """Return one log's keyframes sorted by timestamp."""
+    log = os.path.basename(lidar_name).split('__')[0]
+    rows = []
+    for index, info in enumerate(data_list):
+        name = os.path.basename(info['lidar_points']['lidar_path'])
+        if name.startswith(log):
+            rows.append((index, info, name))
+    rows.sort(key=lambda item: float(item[1]['timestamp']))
+    if not rows:
+        raise FileNotFoundError(f'No keyframes found for {log}')
+    return log, rows
+
+
+def _subsample(xyz, rgb, max_points):
+    if len(xyz) <= max_points:
+        return xyz, rgb
+    step = int(math.ceil(len(xyz) / max_points))
+    return xyz[::step], rgb[::step]
+
+
+def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
+                         score_thr, max_points):
+    """Infer one keyframe and pack synchronized Foxglove messages."""
+    xyz = accumulate_sweeps(info, sweeps_num)
+    boxes, images, meta = infer_loaded(
+        model, dataset, index, score_thr, class_names)
+    rgb = _colorize_points(xyz, images, meta)
+    if rgb is None:
+        rgb = np.repeat(np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None],
+                        len(xyz), axis=0)
+    xyz, rgb = _subsample(xyz, rgb, max_points)
+    gt_boxes = gt_boxes_from_info(info)
+    return {
+        'time': int(float(info['timestamp']) * 1_000_000_000),
+        'cloud': make_pointcloud(xyz, rgb),
+        'detections': make_scene(boxes, replace=True),
+        'ground_truth': make_gt_scene(gt_boxes, replace=True),
+        'predictions': len(boxes),
+        'ground_truth_count': len(gt_boxes),
+        'points': len(xyz),
+    }
+
+
+class _ScenePlayer:
+    """Clock for one cached scene. Foxglove play, pause, and seek drive it."""
+
+    def __init__(self):
+        self.frames = []
+        self.index = 0
+        self.status = PlaybackStatus.Paused
+        self.speed = 1.0
+        self.ready = False
+        self._wall = time.perf_counter()
+        self._anchor = 0
+
+    def current_time(self):
+        if not self.frames:
+            return 0
+        return self.frames[self.index]['time']
+
+    def play(self):
+        if not self.frames:
+            return
+        if self.status == PlaybackStatus.Ended:
+            self.index = 0
+        self.status = PlaybackStatus.Playing
+        self._wall = time.perf_counter()
+        self._anchor = self.current_time()
+
+    def pause(self):
+        if self.status != PlaybackStatus.Ended:
+            self.status = PlaybackStatus.Paused
+
+    def set_speed(self, speed):
+        if speed is None:
+            return
+        self.speed = float(speed) or 1.0
+        self._wall = time.perf_counter()
+        self._anchor = self.current_time()
+
+    def seek(self, timestamp):
+        if not self.frames:
+            return
+        target = int(timestamp)
+        self.index = min(
+            range(len(self.frames)),
+            key=lambda i: abs(self.frames[i]['time'] - target),
+        )
+        if self.status == PlaybackStatus.Ended:
+            self.status = PlaybackStatus.Paused
+        self._wall = time.perf_counter()
+        self._anchor = self.current_time()
+
+    def tick(self):
+        """Advance to the frame due at the current wall clock."""
+        if self.status != PlaybackStatus.Playing or len(self.frames) < 2:
+            return
+        elapsed = (time.perf_counter() - self._wall) * max(self.speed, 0.0) * 1e9
+        target = self._anchor + elapsed
+        while (self.index + 1 < len(self.frames)
+               and self.frames[self.index + 1]['time'] <= target):
+            self.index += 1
+        hold = int(0.5e9 / max(self.speed, 0.05))
+        if self.index == len(self.frames) - 1 and target > self.frames[-1]['time'] + hold:
+            self.status = PlaybackStatus.Ended
+
+
+class _PlaybackListener(ServerListener):
+    """Translate Foxglove's pause, play, and seek buttons into player state."""
+
+    def __init__(self, player, lock):
+        self._player = player
+        self._lock = lock
+
+    def on_playback_control_request(
+            self, playback_control_request: PlaybackControlRequest):
+        with self._lock:
+            player = self._player
+            did_seek = playback_control_request.seek_time is not None
+            if did_seek:
+                player.seek(playback_control_request.seek_time)
+            player.set_speed(playback_control_request.playback_speed)
+            command = playback_control_request.playback_command
+            if command == PlaybackCommand.Play:
+                player.play()
+            elif command == PlaybackCommand.Pause:
+                player.pause()
+            return PlaybackState(
+                status=player.status,
+                current_time=player.current_time(),
+                playback_speed=player.speed,
+                did_seek=did_seek,
+                request_id=playback_control_request.request_id,
+            )
+
+
+def _publish_frame(points, detections, ground_truth, frame):
+    points.log(frame['cloud'], log_time=frame['time'])
+    detections.log(frame['detections'], log_time=frame['time'])
+    ground_truth.log(frame['ground_truth'], log_time=frame['time'])
+
+
+def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
+               score_thr, max_points, host, port):
+    """Infer a full scene, then play it under Foxglove's timeline controls."""
+    with open(infos_path, 'rb') as f:
+        data_list = pickle.load(f)['data_list']
+    log, rows = scene_rows(data_list, lidar_name)
+    duration = float(rows[-1][1]['timestamp']) - float(rows[0][1]['timestamp'])
+    start_ns = int(float(rows[0][1]['timestamp']) * 1_000_000_000)
+    end_ns = int(float(rows[-1][1]['timestamp']) * 1_000_000_000)
+    print(f'Scene {log}: {len(rows)} keyframes over {duration:.1f}s',
+          flush=True)
+    model, dataset, class_names = load_detector(
+        infos_path, config, checkpoint)
+    points = PointCloudChannel('/lidar')
+    detections = SceneUpdateChannel('/detections')
+    ground_truth = SceneUpdateChannel('/ground_truth')
+    player = _ScenePlayer()
+    lock = threading.Lock()
+    server = foxglove.start_server(
+        host=host,
+        port=port,
+        capabilities=[Capability.PlaybackControl, Capability.Time],
+        playback_time_range=(start_ns, end_ns),
+        server_listener=_PlaybackListener(player, lock),
+    )
+    print(f'Foxglove WebSocket listening on ws://{host}:{port}', flush=True)
+    print('Reconnect, then use Foxglove pause and play. The scene stops at',
+          flush=True)
+    print('the last frame instead of looping. Drag the timeline to seek.',
+          flush=True)
+
+    cache = []
+    for number, (index, info, name) in enumerate(rows, 1):
+        started = time.perf_counter()
+        frame = build_playback_frame(
+            model, dataset, class_names, info, index, sweeps_num, score_thr,
+            max_points)
+        cache.append(frame)
+        print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
+              f'{frame["predictions"]} pred, {frame["ground_truth_count"]} GT, '
+              f'{time.perf_counter() - started:.1f}s', flush=True)
+
+    with lock:
+        player.frames = cache
+        player.ready = True
+        player.play()
+    print(f'Playing {len(cache)} frames. Pause and play from the Foxglove '
+          f'timeline.', flush=True)
+
+    published = None
+    last_status = None
+    while True:
+        with lock:
+            player.tick()
+            index = player.index
+            frame = player.frames[index]
+            status = player.status
+            current = player.current_time()
+            speed = player.speed
+        if index != published:
+            _publish_frame(points, detections, ground_truth, frame)
+            server.broadcast_time(current)
+            published = player.index
+        if status != last_status:
+            server.broadcast_playback_state(PlaybackState(
+                status=status,
+                current_time=current,
+                playback_speed=speed,
+                did_seek=False,
+                request_id=None,
+            ))
+            last_status = status
+        time.sleep(0.02)
+
+
 def load_scene(pcd_path, detections_path, ann_path=None, img_dir=None,
                max_points=120000):
     """Return ``(xyz, rgb, boxes)`` in the LiDAR frame."""
@@ -250,8 +548,10 @@ def load_sweep_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         step = int(math.ceil(len(xyz) / max_points))
         xyz = xyz[::step]
         rgb = rgb[::step]
-    print(f'Streaming {len(xyz):,} points and {len(boxes)} boxes', flush=True)
-    return xyz, rgb, boxes
+    gt_boxes = gt_boxes_from_info(info)
+    print(f'Streaming {len(xyz):,} points, {len(boxes)} predictions, '
+          f'and {len(gt_boxes)} ground-truth boxes', flush=True)
+    return xyz, rgb, boxes, gt_boxes
 
 
 def make_pointcloud(xyz, rgb):
@@ -296,7 +596,7 @@ def _box_color(box):
     return motion_color(box.get('motion', 'static'), class_color, 'motion')
 
 
-def make_scene(boxes):
+def make_scene(boxes, replace=False):
     """Build wireframes and translucent cubes for predicted boxes."""
     entities = []
     corners = lidar_box_corners(
@@ -341,16 +641,77 @@ def make_scene(boxes):
                 indices=[],
             )],
         ))
-    return SceneUpdate(entities=entities)
+    return SceneUpdate(
+        deletions=([SceneEntityDeletion(type=SceneEntityDeletionType.All)]
+                   if replace else []),
+        entities=entities,
+    )
 
 
-def serve(pointcloud, scene, host, port, once=False):
+def make_gt_scene(boxes, replace=False):
+    """White wireframes and class names for ground-truth boxes."""
+    entities = []
+    corners = lidar_box_corners(
+        [box['bbox_3d'] for box in boxes]) if boxes else np.zeros((0, 8, 3))
+    white = Color(r=1.0, g=1.0, b=1.0, a=1.0)
+    for i, box in enumerate(boxes):
+        bbox = np.asarray(box['bbox_3d'], dtype=np.float64)
+        points = []
+        for a, edge_b in BOX_EDGES:
+            for idx in (a, edge_b):
+                points.append(Point3(
+                    x=float(corners[i, idx, 0]),
+                    y=float(corners[i, idx, 1]),
+                    z=float(corners[i, idx, 2]),
+                ))
+        name = box.get('class_name', 'object')
+        entities.append(SceneEntity(
+            frame_id=FRAME_ID,
+            id=f'gt_{i:03d}_{name}',
+            lines=[LinePrimitive(
+                type=LinePrimitiveLineType.LineList,
+                pose=_IDENTITY,
+                thickness=0.08,
+                scale_invariant=False,
+                points=points,
+                color=white,
+                colors=[],
+                indices=[],
+            )],
+            texts=[TextPrimitive(
+                pose=Pose(
+                    position=Vector3(
+                        x=float(bbox[0]),
+                        y=float(bbox[1]),
+                        z=float(bbox[2] + bbox[5] + 0.4),
+                    ),
+                    orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+                ),
+                billboard=True,
+                font_size=16,
+                scale_invariant=True,
+                color=white,
+                text=f'GT {name}',
+            )],
+        ))
+    return SceneUpdate(
+        deletions=([SceneEntityDeletion(type=SceneEntityDeletionType.All)]
+                   if replace else []),
+        entities=entities,
+    )
+
+
+def serve(pointcloud, scene, host, port, gt_scene=None, once=False):
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
+    ground_truth = SceneUpdateChannel('/ground_truth')
+    if gt_scene is None:
+        gt_scene = SceneUpdate(entities=[])
     if once:
         with foxglove.open_mcap('/tmp/bevfusion_foxglove.mcap'):
             points.log(pointcloud)
             detections.log(scene)
+            ground_truth.log(gt_scene)
         print('Wrote /tmp/bevfusion_foxglove.mcap')
         return
 
@@ -360,13 +721,17 @@ def serve(pointcloud, scene, host, port, once=False):
     print('Open https://app.foxglove.dev', flush=True)
     print('Choose Open connection -> Foxglove WebSocket ->', url, flush=True)
     print('Add a 3D panel, set its display frame to "lidar",', flush=True)
-    print('and enable topics /lidar and /detections.', flush=True)
+    print('and enable /lidar, /detections, and /ground_truth.', flush=True)
+    print('Predictions stay colored. Ground truth is white wireframes',
+          flush=True)
+    print('labeled "GT <class>".', flush=True)
     print('Ctrl-C stops the stream. Coordinates stay in the LiDAR frame;',
           flush=True)
     print('z=0 is the sensor, about 1.7 m above the road.', flush=True)
     while True:
         points.log(pointcloud)
         detections.log(scene)
+        ground_truth.log(gt_scene)
         time.sleep(1.0)
 
 
@@ -396,6 +761,9 @@ def parse_args():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument(
+        '--play-scene', action='store_true',
+        help='infer every keyframe in this log, then replay it in order')
+    parser.add_argument(
         '--once', action='store_true',
         help='write one MCAP to /tmp and exit instead of serving')
     return parser.parse_args()
@@ -403,8 +771,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.play_scene:
+        play_scene(
+            os.path.basename(args.pcd), args.infos, args.sweeps, args.config,
+            args.checkpoint, args.score_thr, args.max_points, args.host,
+            args.port)
+        return
+    gt_boxes = []
     if args.sweeps > 0:
-        xyz, rgb, boxes = load_sweep_scene(
+        xyz, rgb, boxes, gt_boxes = load_sweep_scene(
             os.path.basename(args.pcd), args.infos, args.sweeps, args.config,
             args.checkpoint, args.score_thr, args.max_points)
     else:
@@ -412,7 +787,7 @@ def main():
             args.pcd, args.detections, args.ann, args.img_dir, args.max_points)
     serve(
         make_pointcloud(xyz, rgb), make_scene(boxes), args.host, args.port,
-        once=args.once)
+        gt_scene=make_gt_scene(gt_boxes), once=args.once)
 
 
 if __name__ == '__main__':

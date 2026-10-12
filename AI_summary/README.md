@@ -11,6 +11,9 @@ not duplicated here.
 
 ## Commits
 
+- [Foxglove scene playback](2026-10-12-foxglove-scene-playback.md)
+  — full-scene playback with synchronized predictions, ground truth, and
+  Foxglove pause, play, and seek.
 - [Foxglove multi-sweep stream](2026-10-11-foxglove-multisweep-stream.md)
   — live Foxglove point cloud and 3D boxes, with the keyframe plus nine past
   LiDAR sweeps.
