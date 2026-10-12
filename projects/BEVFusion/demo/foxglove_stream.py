@@ -17,7 +17,9 @@ Example:
 
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
-``lidar`` and enable ``/lidar`` and ``/detections``.
+``lidar`` and enable ``/lidar`` and ``/detections``. Each camera is also
+published as its original JPEG on ``/CAM_FRONT``, ``/CAM_FRONT_LEFT``, and
+the other four ``/CAM_*`` topics.
 """
 import argparse
 import math
@@ -39,12 +41,13 @@ from multi_modality_demo import (  # noqa: E402
     lidar_box_corners, load_lidar_xyz)
 
 import foxglove  # noqa: E402
-from foxglove.channels import PointCloudChannel, SceneUpdateChannel  # noqa: E402
+from foxglove.channels import (  # noqa: E402
+    CompressedImageChannel, PointCloudChannel, SceneUpdateChannel)
 from foxglove.websocket import (  # noqa: E402
     Capability, PlaybackCommand, PlaybackControlRequest, PlaybackState,
     PlaybackStatus, ServerListener)
 from foxglove.messages import (  # noqa: E402
-    Color, CubePrimitive, LinePrimitive, LinePrimitiveLineType,
+    Color, CompressedImage, CubePrimitive, LinePrimitive, LinePrimitiveLineType,
     PackedElementField, PackedElementFieldNumericType, Point3, PointCloud,
     Pose, Quaternion, SceneEntity, SceneEntityDeletion,
     SceneEntityDeletionType, SceneUpdate, TextPrimitive, Vector3)
@@ -229,14 +232,17 @@ def _load_cameras(info, cache):
     import mmcv
     from mmengine.fileio import get
 
-    images, paths = [], []
+    images, paths, names, jpegs = [], [], [], []
     cam2img, lidar2cam, cam2lidar, lidar2img = [], [], [], []
     for cam_id, cam_item in info['images'].items():
         path = _resolve_image(cam_id, cam_item['img_path'])
+        payload = bytes(get(path))
         img = mmcv.imfrombytes(
-            get(path), flag='color', backend='pillow', channel_order='rgb')
+            payload, flag='color', backend='pillow', channel_order='rgb')
         images.append(img)
         paths.append(path)
+        names.append(cam_id)
+        jpegs.append(payload)
         intrinsic = cache.intrinsic(cam_id, cam_item['cam2img'])
         extrinsic = np.asarray(cam_item['lidar2cam'], dtype=np.float32)
         rotation = extrinsic[:3, :3]
@@ -259,6 +265,8 @@ def _load_cameras(info, cache):
     return {
         'images': images,
         'paths': paths,
+        'names': names,
+        'jpeg': jpegs,
         'cam2img': np.stack(cam2img, axis=0),
         'lidar2cam': np.stack(lidar2cam, axis=0),
         'cam2lidar': np.stack(cam2lidar, axis=0),
@@ -415,7 +423,12 @@ def infer_loaded(model, dataset, index, score_thr, class_names, sweeps_num=9,
         'bbox_3d': bbox.tolist(),
     } for label, bbox, motion in zip(labels, bboxes, motions)]
     display_xyz = np.ascontiguousarray(points[:, :3])
-    meta = {'lidar2img': cameras['lidar2img'], 'img_path': cameras['paths']}
+    meta = {
+        'lidar2img': cameras['lidar2img'],
+        'img_path': cameras['paths'],
+        'camera_names': cameras['names'],
+        'camera_jpeg': cameras['jpeg'],
+    }
     return boxes, cameras['images'], meta, display_xyz
 
 
@@ -456,6 +469,8 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
         'cloud': make_pointcloud(xyz, rgb),
         'detections': make_scene(boxes, replace=True),
         'ground_truth': make_gt_scene(gt_boxes, replace=True),
+        'cameras': make_camera_images(
+            meta.get('camera_names', []), meta.get('camera_jpeg', [])),
         'predictions': len(boxes),
         'ground_truth_count': len(gt_boxes),
         'points': len(xyz),
@@ -555,10 +570,19 @@ class _PlaybackListener(ServerListener):
             )
 
 
-def _publish_frame(points, detections, ground_truth, frame):
+def _publish_frame(points, detections, ground_truth, camera_channels, frame):
     points.log(frame['cloud'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
     ground_truth.log(frame['ground_truth'], log_time=frame['time'])
+    for name, message in frame.get('cameras', {}).items():
+        channel = camera_channels.get(name)
+        if channel is not None:
+            channel.log(message, log_time=frame['time'])
+
+
+def _camera_channels(names):
+    """One compressed-image topic per camera, named ``/CAM_FRONT`` and so on."""
+    return {name: CompressedImageChannel(f'/{name}') for name in names}
 
 
 def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
@@ -578,6 +602,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
+    camera_names = list(rows[0][1].get('images', {}).keys())
+    camera_channels = _camera_channels(camera_names)
     player = _ScenePlayer()
     lock = threading.Lock()
     server = foxglove.start_server(
@@ -591,6 +617,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('Reconnect, then use Foxglove pause and play. The scene stops at',
           flush=True)
     print('the last frame instead of looping. Drag the timeline to seek.',
+          flush=True)
+    print('Image panels: ' + ', '.join(f'/{name}' for name in camera_names),
           flush=True)
 
     frames = []
@@ -623,7 +651,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
             current = player.current_time()
             speed = player.speed
         if index != published:
-            _publish_frame(points, detections, ground_truth, frame)
+            _publish_frame(
+                points, detections, ground_truth, camera_channels, frame)
             server.broadcast_time(current)
             published = player.index
         if status != last_status:
@@ -664,7 +693,8 @@ def load_scene(pcd_path, detections_path, ann_path=None, img_dir=None,
     with open(detections_path, 'r', encoding='utf-8') as f:
         boxes = json.load(f).get('boxes', [])
     print(f'Streaming {len(xyz):,} points and {len(boxes)} boxes', flush=True)
-    return xyz, rgb, boxes
+    cameras = _jpeg_messages(_camera_jpegs(ann_path, img_dir) if ann_path else [])
+    return xyz, rgb, boxes, cameras
 
 
 def load_sweep_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
@@ -687,9 +717,26 @@ def load_sweep_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         xyz = xyz[::step]
         rgb = rgb[::step]
     gt_boxes = gt_boxes_from_info(info)
+    cameras = make_camera_images(
+        meta.get('camera_names', []), meta.get('camera_jpeg', []))
     print(f'Streaming {len(xyz):,} points, {len(boxes)} predictions, '
-          f'and {len(gt_boxes)} ground-truth boxes', flush=True)
-    return xyz, rgb, boxes, gt_boxes
+          f'{len(gt_boxes)} ground-truth boxes, and {len(cameras)} cameras',
+          flush=True)
+    return xyz, rgb, boxes, gt_boxes, cameras
+
+
+def make_camera_images(names, jpegs):
+    """Pack the original JPEG bytes for each camera. No re-encode."""
+    images = {}
+    for name, payload in zip(names, jpegs):
+        if not payload:
+            continue
+        images[name] = CompressedImage(
+            frame_id=name,
+            data=payload,
+            format='jpeg',
+        )
+    return images
 
 
 def make_pointcloud(xyz, rgb):
@@ -839,10 +886,37 @@ def make_gt_scene(boxes, replace=False):
     )
 
 
-def serve(pointcloud, scene, host, port, gt_scene=None, once=False):
+def _camera_jpegs(ann_path, img_dir):
+    """Return ``(name, jpeg_bytes)`` for each camera in an annotation pkl."""
+    with open(ann_path, 'rb') as f:
+        images = pickle.load(f)['data_list'][0].get('images', {})
+    pairs = []
+    for name, cam_item in images.items():
+        path = _resolve_image(name, cam_item.get('img_path', ''))
+        if img_dir:
+            candidate = os.path.join(
+                img_dir, os.path.basename(cam_item.get('img_path') or ''))
+            if os.path.exists(candidate):
+                path = candidate
+        if path and os.path.exists(path):
+            with open(path, 'rb') as handle:
+                pairs.append((name, handle.read()))
+    return pairs
+
+
+def _jpeg_messages(pairs):
+    return make_camera_images(
+        [name for name, _payload in pairs],
+        [payload for _name, payload in pairs])
+
+
+def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
+          cameras=None):
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
+    cameras = cameras or {}
+    camera_channels = _camera_channels(cameras)
     if gt_scene is None:
         gt_scene = SceneUpdate(entities=[])
     if once:
@@ -850,6 +924,8 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False):
             points.log(pointcloud)
             detections.log(scene)
             ground_truth.log(gt_scene)
+            for name, message in cameras.items():
+                camera_channels[name].log(message)
         print('Wrote /tmp/bevfusion_foxglove.mcap')
         return
 
@@ -860,6 +936,9 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False):
     print('Choose Open connection -> Foxglove WebSocket ->', url, flush=True)
     print('Add a 3D panel, set its display frame to "lidar",', flush=True)
     print('and enable /lidar, /detections, and /ground_truth.', flush=True)
+    if camera_channels:
+        print('Image panels: ' + ', '.join(
+            f'/{name}' for name in camera_channels), flush=True)
     print('Predictions stay colored. Ground truth is white wireframes',
           flush=True)
     print('labeled "GT <class>".', flush=True)
@@ -870,6 +949,8 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False):
         points.log(pointcloud)
         detections.log(scene)
         ground_truth.log(gt_scene)
+        for name, message in cameras.items():
+            camera_channels[name].log(message)
         time.sleep(1.0)
 
 
@@ -916,16 +997,17 @@ def main():
             args.port)
         return
     gt_boxes = []
+    cameras = {}
     if args.sweeps > 0:
-        xyz, rgb, boxes, gt_boxes = load_sweep_scene(
+        xyz, rgb, boxes, gt_boxes, cameras = load_sweep_scene(
             os.path.basename(args.pcd), args.infos, args.sweeps, args.config,
             args.checkpoint, args.score_thr, args.max_points)
     else:
-        xyz, rgb, boxes = load_scene(
+        xyz, rgb, boxes, cameras = load_scene(
             args.pcd, args.detections, args.ann, args.img_dir, args.max_points)
     serve(
         make_pointcloud(xyz, rgb), make_scene(boxes), args.host, args.port,
-        gt_scene=make_gt_scene(gt_boxes), once=args.once)
+        gt_scene=make_gt_scene(gt_boxes), once=args.once, cameras=cameras)
 
 
 if __name__ == '__main__':
