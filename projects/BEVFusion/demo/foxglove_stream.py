@@ -17,9 +17,9 @@ Example:
 
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
-``lidar`` and enable ``/lidar`` and ``/detections``. Each camera is also
-published as its original JPEG on ``/CAM_FRONT``, ``/CAM_FRONT_LEFT``, and
-the other four ``/CAM_*`` topics.
+``lidar`` and enable ``/lidar``, ``/detections``, and ``/ego_vehicle``. Each
+camera is also published as its original JPEG on ``/CAM_FRONT``,
+``/CAM_FRONT_LEFT``, and the other four ``/CAM_*`` topics.
 """
 import argparse
 import math
@@ -63,6 +63,18 @@ _IDENTITY = Pose(
     position=Vector3(x=0.0, y=0.0, z=0.0),
     orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
 )
+# Ego car in the LiDAR frame. z=0 is the sensor; the road is about z=-1.7.
+# Top of the roof touches the LiDAR base; the underbody stays above the road.
+# Dimensions approximate a nuScenes sedan (e.g. ~Renault Zoe class kit).
+# Yaw is clockwise 90 deg from +x so length aligns with the self-occlusion void.
+EGO_LENGTH_M = 4.08
+EGO_WIDTH_M = 1.73
+EGO_HEIGHT_M = 1.55
+EGO_CENTER_X_M = 0.0
+EGO_CENTER_Y_M = 0.0
+EGO_YAW_RAD = -0.5 * math.pi
+EGO_GROUND_Z_M = -1.7
+EGO_COLOR = (0.15, 0.85, 0.95)
 
 
 def _yaw_quaternion(yaw):
@@ -343,19 +355,31 @@ def select_sweep_frame(data_list, lidar_name, sweeps_num):
     return index, info
 
 
-def gt_boxes_from_info(info):
-    """Return nuScenes boxes converted to the LiDAR bottom-center convention."""
+def gt_boxes_from_info(info, class_names=None, metainfo=None):
+    """Return nuScenes boxes converted to the LiDAR bottom-center convention.
+
+    Info files store ``bbox_label_3d`` with ``metainfo['categories']`` ids,
+    which are not the same order as the detector ``classes`` list.
+    """
     from mmdet3d.structures import LiDARInstance3DBoxes
 
-    rows, names = [], []
+    names = list(class_names or CLASS_NAMES)
+    categories = (metainfo or {}).get('categories') or {}
+    if categories:
+        id_to_name = {int(v): str(k) for k, v in categories.items()}
+    else:
+        id_to_name = {i: name for i, name in enumerate(names)}
+
+    rows, labels = [], []
     for obj in info.get('instances', []):
         if not obj.get('bbox_3d_isvalid', True):
             continue
-        label = int(obj.get('bbox_label_3d', -1))
-        if label < 0:
+        raw = int(obj.get('bbox_label_3d', -1))
+        name = id_to_name.get(raw)
+        if name is None:
             continue
         rows.append(obj['bbox_3d'][:7])
-        names.append(CLASS_NAMES[label] if label < len(CLASS_NAMES) else str(label))
+        labels.append(name)
     if not rows:
         return []
     converted = LiDARInstance3DBoxes(
@@ -364,7 +388,7 @@ def gt_boxes_from_info(info):
         origin=(0.5, 0.5, 0.5),
     )
     boxes = []
-    for name, row in zip(names, converted.tensor.detach().cpu().numpy()):
+    for name, row in zip(labels, converted.tensor.detach().cpu().numpy()):
         boxes.append({'class_name': name, 'bbox_3d': row[:7].tolist()})
     print(f'Ground truth: {len(boxes)} boxes', flush=True)
     return boxes
@@ -463,12 +487,15 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
         rgb = np.repeat(np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None],
                         len(xyz), axis=0)
     xyz, rgb = _subsample(xyz, rgb, max_points)
-    gt_boxes = gt_boxes_from_info(info)
+    gt_boxes = gt_boxes_from_info(
+        info, class_names=class_names,
+        metainfo=getattr(dataset, 'metainfo', None))
     return {
         'time': int(float(info['timestamp']) * 1_000_000_000),
         'cloud': make_pointcloud(xyz, rgb),
         'detections': make_scene(boxes, replace=True),
         'ground_truth': make_gt_scene(gt_boxes, replace=True),
+        'ego_vehicle': make_ego_scene(replace=True),
         'cameras': make_camera_images(
             meta.get('camera_names', []), meta.get('camera_jpeg', [])),
         'predictions': len(boxes),
@@ -570,10 +597,13 @@ class _PlaybackListener(ServerListener):
             )
 
 
-def _publish_frame(points, detections, ground_truth, camera_channels, frame):
+def _publish_frame(points, detections, ground_truth, ego_vehicle,
+                   camera_channels, frame):
     points.log(frame['cloud'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
     ground_truth.log(frame['ground_truth'], log_time=frame['time'])
+    # Build ego live so orientation/dimension tweaks do not require re-inference.
+    ego_vehicle.log(make_ego_scene(replace=True), log_time=frame['time'])
     for name, message in frame.get('cameras', {}).items():
         channel = camera_channels.get(name)
         if channel is not None:
@@ -602,6 +632,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
+    ego_vehicle = SceneUpdateChannel('/ego_vehicle')
     camera_names = list(rows[0][1].get('images', {}).keys())
     camera_channels = _camera_channels(camera_names)
     player = _ScenePlayer()
@@ -618,6 +649,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
           flush=True)
     print('the last frame instead of looping. Drag the timeline to seek.',
           flush=True)
+    print('Enable /ego_vehicle for the cyan self-driving-car box.', flush=True)
     print('Image panels: ' + ', '.join(f'/{name}' for name in camera_names),
           flush=True)
 
@@ -652,7 +684,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
             speed = player.speed
         if index != published:
             _publish_frame(
-                points, detections, ground_truth, camera_channels, frame)
+                points, detections, ground_truth, ego_vehicle,
+                camera_channels, frame)
             server.broadcast_time(current)
             published = player.index
         if status != last_status:
@@ -716,7 +749,9 @@ def load_sweep_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         step = int(math.ceil(len(xyz) / max_points))
         xyz = xyz[::step]
         rgb = rgb[::step]
-    gt_boxes = gt_boxes_from_info(info)
+    gt_boxes = gt_boxes_from_info(
+        info, class_names=class_names,
+        metainfo=getattr(dataset, 'metainfo', None))
     cameras = make_camera_images(
         meta.get('camera_names', []), meta.get('camera_jpeg', []))
     print(f'Streaming {len(xyz):,} points, {len(boxes)} predictions, '
@@ -833,6 +868,87 @@ def make_scene(boxes, replace=False):
     )
 
 
+def ego_vehicle_bbox():
+    """Return the ego car as a bottom-center LiDAR box ``[x,y,z,l,w,h,yaw]``.
+
+    The roof top sits at the LiDAR base (``z = 0``). The underbody stays a
+    few centimeters above the nominal road plane near ``z = -1.7``.
+    """
+    height = min(EGO_HEIGHT_M, -EGO_GROUND_Z_M - 0.12)
+    z_bottom = -height
+    return [
+        EGO_CENTER_X_M,
+        EGO_CENTER_Y_M,
+        z_bottom,
+        EGO_LENGTH_M,
+        EGO_WIDTH_M,
+        height,
+        EGO_YAW_RAD,
+    ]
+
+
+def make_ego_scene(replace=False):
+    """Cyan car-shaped box filling the LiDAR self-occlusion void."""
+    bbox = np.asarray(ego_vehicle_bbox(), dtype=np.float64)
+    corners = lidar_box_corners([bbox])[0]
+    r, g, b = EGO_COLOR
+    points = []
+    for a, edge_b in BOX_EDGES:
+        for idx in (a, edge_b):
+            points.append(Point3(
+                x=float(corners[idx, 0]),
+                y=float(corners[idx, 1]),
+                z=float(corners[idx, 2]),
+            ))
+    entity = SceneEntity(
+        frame_id=FRAME_ID,
+        id='ego_vehicle',
+        cubes=[CubePrimitive(
+            pose=Pose(
+                position=Vector3(
+                    x=float(bbox[0]),
+                    y=float(bbox[1]),
+                    z=float(bbox[2] + 0.5 * bbox[5]),
+                ),
+                orientation=_yaw_quaternion(bbox[6]),
+            ),
+            size=Vector3(
+                x=float(bbox[3]), y=float(bbox[4]), z=float(bbox[5])),
+            color=Color(r=r, g=g, b=b, a=0.35),
+        )],
+        lines=[LinePrimitive(
+            type=LinePrimitiveLineType.LineList,
+            pose=_IDENTITY,
+            thickness=0.08,
+            scale_invariant=False,
+            points=points,
+            color=Color(r=r, g=g, b=b, a=1.0),
+            colors=[],
+            indices=[],
+        )],
+        texts=[TextPrimitive(
+            pose=Pose(
+                position=Vector3(
+                    x=float(bbox[0]),
+                    y=float(bbox[1]),
+                    z=float(bbox[2] + bbox[5] + 0.25),
+                ),
+                orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+            ),
+            billboard=True,
+            font_size=16,
+            scale_invariant=True,
+            color=Color(r=r, g=g, b=b, a=1.0),
+            text='ego',
+        )],
+    )
+    return SceneUpdate(
+        deletions=([SceneEntityDeletion(type=SceneEntityDeletionType.All)]
+                   if replace else []),
+        entities=[entity],
+    )
+
+
 def make_gt_scene(boxes, replace=False):
     """White wireframes and class names for ground-truth boxes."""
     entities = []
@@ -911,19 +1027,23 @@ def _jpeg_messages(pairs):
 
 
 def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
-          cameras=None):
+          cameras=None, ego_scene=None):
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
+    ego_vehicle = SceneUpdateChannel('/ego_vehicle')
     cameras = cameras or {}
     camera_channels = _camera_channels(cameras)
     if gt_scene is None:
         gt_scene = SceneUpdate(entities=[])
+    if ego_scene is None:
+        ego_scene = make_ego_scene(replace=True)
     if once:
         with foxglove.open_mcap('/tmp/bevfusion_foxglove.mcap'):
             points.log(pointcloud)
             detections.log(scene)
             ground_truth.log(gt_scene)
+            ego_vehicle.log(ego_scene)
             for name, message in cameras.items():
                 camera_channels[name].log(message)
         print('Wrote /tmp/bevfusion_foxglove.mcap')
@@ -935,13 +1055,15 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
     print('Open https://app.foxglove.dev', flush=True)
     print('Choose Open connection -> Foxglove WebSocket ->', url, flush=True)
     print('Add a 3D panel, set its display frame to "lidar",', flush=True)
-    print('and enable /lidar, /detections, and /ground_truth.', flush=True)
+    print('and enable /lidar, /detections, /ground_truth, and /ego_vehicle.',
+          flush=True)
     if camera_channels:
         print('Image panels: ' + ', '.join(
             f'/{name}' for name in camera_channels), flush=True)
     print('Predictions stay colored. Ground truth is white wireframes',
           flush=True)
-    print('labeled "GT <class>".', flush=True)
+    print('labeled "GT <class>". The cyan /ego_vehicle box is the self car.',
+          flush=True)
     print('Ctrl-C stops the stream. Coordinates stay in the LiDAR frame;',
           flush=True)
     print('z=0 is the sensor, about 1.7 m above the road.', flush=True)
@@ -949,6 +1071,7 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
         points.log(pointcloud)
         detections.log(scene)
         ground_truth.log(gt_scene)
+        ego_vehicle.log(ego_scene)
         for name, message in cameras.items():
             camera_channels[name].log(message)
         time.sleep(1.0)

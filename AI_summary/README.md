@@ -11,6 +11,15 @@ not duplicated here.
 
 ## Commits
 
+- [Failure-analysis report](2026-10-19-failure-analysis-report.md)
+  — unique per-object diagnostics, tag co-occurrence, miss mechanisms, and
+  confidence-threshold curves for the Foxglove scene.
+- [Ground-truth evaluation and failure modes](2026-10-19-gt-eval-failure-modes.md)
+  — class+3D-IoU matching, PR/FP/FN baseline on the Foxglove scene, and a
+  ranked failure catalog with timestamps.
+- [Non-deterministic voxelization latency](2026-10-19-voxelization-latency.md)
+  — switches to the fast hard-voxelization CUDA path, reducing measured
+  voxelization from about 100.7 ms to 1.329 ms.
 - [Foxglove scene playback](2026-10-12-foxglove-scene-playback.md)
   — full-scene playback with synchronized predictions, ground truth, and
   Foxglove pause, play, and seek.

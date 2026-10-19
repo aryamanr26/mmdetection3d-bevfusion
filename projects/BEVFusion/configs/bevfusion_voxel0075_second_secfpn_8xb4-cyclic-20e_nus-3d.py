@@ -42,6 +42,7 @@ model = dict(
             point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
             voxel_size=[0.075, 0.075, 0.2],
             max_voxels=[120000, 160000],
+            deterministic=False,
             voxelize_reduce=True)),
     img_backbone=dict(
         type='mmdet.SwinTransformer',
