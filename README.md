@@ -112,6 +112,13 @@ This project is released under the [Apache 2.0 license](LICENSE).
 
 Please refer to [changelog.md](docs/en/notes/changelog.md) for details and release history.
 
+## Daily activity logs
+
+Session notes for work in this checkout (newest first):
+
+- [2026-10-24](docs/daily/2026-10-24.md) — LiDAR elevation grid for the local nuScenes keyframes, with Foxglove heatmaps.
+- Index: [docs/daily/](docs/daily/README.md)
+
 ## Benchmark and model zoo
 
 Results and models are available in the [model zoo](docs/en/model_zoo.md).

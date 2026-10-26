@@ -17,9 +17,13 @@ Example:
 
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
-``lidar`` and enable ``/lidar``, ``/detections``, and ``/ego_vehicle``. Each
-camera is also published as its original JPEG on ``/CAM_FRONT``,
-``/CAM_FRONT_LEFT``, and the other four ``/CAM_*`` topics.
+``lidar`` and enable ``/lidar``, ``/detections``, and ``/ego_vehicle``. The
+keyframe elevation map is on ``/elevation/ground``, ``/elevation/slope``, and
+``/elevation/obstacle``. The grid plane is the road under the vehicle. Set
+the color mode to RGBA (separate fields) and the elevation field to
+``elevation`` so each bin rises by the slope. Each camera is also published as
+its original JPEG on ``/CAM_FRONT``, ``/CAM_FRONT_LEFT``, and the other four
+``/CAM_*`` topics.
 """
 import argparse
 import math
@@ -39,21 +43,29 @@ from motion_utils import classify_detections, motion_color  # noqa: E402
 from multi_modality_demo import (  # noqa: E402
     BOX_EDGES, CLASS_COLORS, CLASS_NAMES, _colorize_points, _lidar2img_from_ann,
     lidar_box_corners, load_lidar_xyz)
+from elevation_grid import (  # noqa: E402
+    GROUND_HINT_Z, estimate_elevation_grid, layer_rgba)
 
 import foxglove  # noqa: E402
 from foxglove.channels import (  # noqa: E402
-    CompressedImageChannel, PointCloudChannel, SceneUpdateChannel)
+    CompressedImageChannel, GridChannel, PointCloudChannel, SceneUpdateChannel)
 from foxglove.websocket import (  # noqa: E402
     Capability, PlaybackCommand, PlaybackControlRequest, PlaybackState,
     PlaybackStatus, ServerListener)
 from foxglove.messages import (  # noqa: E402
     Color, CompressedImage, CubePrimitive, LinePrimitive, LinePrimitiveLineType,
-    PackedElementField, PackedElementFieldNumericType, Point3, PointCloud,
+    Grid, PackedElementField, PackedElementFieldNumericType, Point3, PointCloud,
     Pose, Quaternion, SceneEntity, SceneEntityDeletion,
-    SceneEntityDeletionType, SceneUpdate, TextPrimitive, Vector3)
+    SceneEntityDeletionType, SceneUpdate, TextPrimitive, Timestamp, Vector2,
+    Vector3)
 
 
 FRAME_ID = 'lidar'
+ELEVATION_TOPICS = (
+    ('ground', '/elevation/ground', 0.0),
+    ('slope', '/elevation/slope', 0.03),
+    ('obstacle', '/elevation/obstacle', 0.06),
+)
 CONFIG = (
     'projects/BEVFusion/configs/'
     'bevfusion_voxel0075_second_secfpn_8xb4-cyclic-20e_nus-3d.py')
@@ -490,17 +502,24 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
     gt_boxes = gt_boxes_from_info(
         info, class_names=class_names,
         metainfo=getattr(dataset, 'metainfo', None))
+    key = _cached_points(info['lidar_points']['lidar_path'], cache)
+    grid_started = time.perf_counter()
+    elevation = estimate_elevation_grid(key[:, :3])
+    time_ns = int(float(info['timestamp']) * 1_000_000_000)
+    elevation_grids = make_elevation_grids(elevation, time_ns)
     return {
-        'time': int(float(info['timestamp']) * 1_000_000_000),
+        'time': time_ns,
         'cloud': make_pointcloud(xyz, rgb),
         'detections': make_scene(boxes, replace=True),
         'ground_truth': make_gt_scene(gt_boxes, replace=True),
         'ego_vehicle': make_ego_scene(replace=True),
         'cameras': make_camera_images(
             meta.get('camera_names', []), meta.get('camera_jpeg', [])),
+        'elevation': elevation_grids,
         'predictions': len(boxes),
         'ground_truth_count': len(gt_boxes),
         'points': len(xyz),
+        'elevation_ms': (time.perf_counter() - grid_started) * 1e3,
     }
 
 
@@ -598,7 +617,7 @@ class _PlaybackListener(ServerListener):
 
 
 def _publish_frame(points, detections, ground_truth, ego_vehicle,
-                   camera_channels, frame):
+                   camera_channels, elevation_channels, frame):
     points.log(frame['cloud'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
     ground_truth.log(frame['ground_truth'], log_time=frame['time'])
@@ -608,6 +627,8 @@ def _publish_frame(points, detections, ground_truth, ego_vehicle,
         channel = camera_channels.get(name)
         if channel is not None:
             channel.log(message, log_time=frame['time'])
+    for kind, channel in elevation_channels.items():
+        channel.log(frame['elevation'][kind], log_time=frame['time'])
 
 
 def _camera_channels(names):
@@ -633,6 +654,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
     ego_vehicle = SceneUpdateChannel('/ego_vehicle')
+    elevation_channels = _elevation_channels()
     camera_names = list(rows[0][1].get('images', {}).keys())
     camera_channels = _camera_channels(camera_names)
     player = _ScenePlayer()
@@ -650,6 +672,10 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('the last frame instead of looping. Drag the timeline to seek.',
           flush=True)
     print('Enable /ego_vehicle for the cyan self-driving-car box.', flush=True)
+    print('Elevation heatmaps sit on the road: /elevation/ground,', flush=True)
+    print('/elevation/slope, /elevation/obstacle. Set Elevation field to',
+          flush=True)
+    print('elevation so each bin shows how far the ground rises.', flush=True)
     print('Image panels: ' + ', '.join(f'/{name}' for name in camera_names),
           flush=True)
 
@@ -662,6 +688,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         frames.append(frame)
         print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
               f'{frame["predictions"]} pred, {frame["ground_truth_count"]} GT, '
+              f'grid {frame["elevation_ms"]:.0f} ms, '
               f'{time.perf_counter() - started:.1f}s', flush=True)
     sensors.release_points()
 
@@ -674,6 +701,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
 
     published = None
     last_status = None
+    last_pub = 0.0
     while True:
         with lock:
             player.tick()
@@ -682,12 +710,17 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
             status = player.status
             current = player.current_time()
             speed = player.speed
-        if index != published:
+        # Republish the current frame even when the scene is paused or has
+        # ended. Foxglove only subscribes to a topic once it is enabled, and
+        # the 3D panel will not draw a grid it never received.
+        now = time.perf_counter()
+        if index != published or now - last_pub >= 0.5:
             _publish_frame(
                 points, detections, ground_truth, ego_vehicle,
-                camera_channels, frame)
+                camera_channels, elevation_channels, frame)
             server.broadcast_time(current)
             published = player.index
+            last_pub = now
         if status != last_status:
             server.broadcast_playback_state(PlaybackState(
                 status=status,
@@ -808,6 +841,95 @@ def make_pointcloud(xyz, rgb):
         fields=fields,
         data=rec.tobytes(),
     )
+
+
+def _elevation_channels():
+    return {kind: GridChannel(topic) for kind, topic, _offset in ELEVATION_TOPICS}
+
+
+def _message_time(time_ns):
+    """Foxglove draws a grid at the timestamp inside the message, not log time."""
+    if not time_ns:
+        return None
+    time_ns = int(time_ns)
+    return Timestamp(time_ns // 1_000_000_000, time_ns % 1_000_000_000)
+
+
+def _road_origin_z(grid):
+    """Ground height under the vehicle, in the LiDAR frame.
+
+    The sensor is about 1.7 m above the road, so a grid posed at z=0 floats.
+    Bins are then raised by how much the surface climbs above this patch.
+    """
+    ground = grid.ground
+    valid = np.isfinite(ground)
+    if not valid.any():
+        return GROUND_HINT_Z
+    ix = int(round((0.0 - grid.x_min) / grid.resolution))
+    iy = int(round((0.0 - grid.y_min) / grid.resolution))
+    radius = max(1, int(round(8.0 / grid.resolution)))
+    y0, y1 = max(0, iy - radius), min(ground.shape[0], iy + radius + 1)
+    x0, x1 = max(0, ix - radius), min(ground.shape[1], ix + radius + 1)
+    patch = ground[y0:y1, x0:x1]
+    finite = patch[np.isfinite(patch)]
+    if finite.size < 10:
+        finite = ground[valid]
+    return float(np.median(finite))
+
+
+def make_elevation_grids(grid, time_ns=0):
+    """Pack ground, slope, and obstacle heatmaps as Foxglove grids.
+
+    The grid corner is ``(x_min, y_min)`` and its plane sits on the road
+    under the vehicle, not at the LiDAR origin. The ``elevation`` field is
+    how many meters that bin's ground is above that road. Foxglove adds it
+    to the pose when the 3D panel elevation field is set to ``elevation``.
+    Unknown cells are transparent. Slope and obstacle sit a few centimeters
+    above the same surface.
+    """
+    ny, nx = grid.ground.shape
+    cell_stride = 8
+    numeric = PackedElementFieldNumericType
+    fields = [
+        PackedElementField(name='red', offset=0, type=numeric.Uint8),
+        PackedElementField(name='green', offset=1, type=numeric.Uint8),
+        PackedElementField(name='blue', offset=2, type=numeric.Uint8),
+        PackedElementField(name='alpha', offset=3, type=numeric.Uint8),
+        PackedElementField(name='elevation', offset=4, type=numeric.Float32),
+    ]
+    road_z = _road_origin_z(grid)
+    rise = np.zeros((ny, nx), dtype=np.float32)
+    known = np.isfinite(grid.ground)
+    rise[known] = grid.ground[known] - road_z
+    dtype = np.dtype([
+        ('r', 'u1'), ('g', 'u1'), ('b', 'u1'), ('a', 'u1'), ('e', '<f4'),
+    ], align=False)
+    grids = {}
+    for kind, _topic, offset in ELEVATION_TOPICS:
+        rgba = layer_rgba(grid, kind)
+        rec = np.empty((ny, nx), dtype=dtype)
+        rec['r'] = rgba[..., 0]
+        rec['g'] = rgba[..., 1]
+        rec['b'] = rgba[..., 2]
+        rec['a'] = rgba[..., 3]
+        rec['e'] = rise
+        pose = Pose(
+            position=Vector3(
+                x=float(grid.x_min), y=float(grid.y_min), z=road_z + offset),
+            orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        grids[kind] = Grid(
+            timestamp=_message_time(time_ns),
+            frame_id=FRAME_ID,
+            pose=pose,
+            column_count=nx,
+            cell_size=Vector2(x=float(grid.resolution), y=float(grid.resolution)),
+            row_stride=nx * cell_stride,
+            cell_stride=cell_stride,
+            fields=fields,
+            data=rec.tobytes(),
+        )
+    return grids
 
 
 def _box_color(box):
@@ -1027,25 +1149,33 @@ def _jpeg_messages(pairs):
 
 
 def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
-          cameras=None, ego_scene=None):
+          cameras=None, ego_scene=None, grids=None):
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
     ego_vehicle = SceneUpdateChannel('/ego_vehicle')
     cameras = cameras or {}
+    grids = grids or {}
     camera_channels = _camera_channels(cameras)
+    elevation_channels = _elevation_channels() if grids else {}
     if gt_scene is None:
         gt_scene = SceneUpdate(entities=[])
     if ego_scene is None:
         ego_scene = make_ego_scene(replace=True)
+
+    def _log_once():
+        points.log(pointcloud)
+        detections.log(scene)
+        ground_truth.log(gt_scene)
+        ego_vehicle.log(ego_scene)
+        for name, message in cameras.items():
+            camera_channels[name].log(message)
+        for kind, channel in elevation_channels.items():
+            channel.log(grids[kind])
+
     if once:
         with foxglove.open_mcap('/tmp/bevfusion_foxglove.mcap'):
-            points.log(pointcloud)
-            detections.log(scene)
-            ground_truth.log(gt_scene)
-            ego_vehicle.log(ego_scene)
-            for name, message in cameras.items():
-                camera_channels[name].log(message)
+            _log_once()
         print('Wrote /tmp/bevfusion_foxglove.mcap')
         return
 
@@ -1057,6 +1187,10 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
     print('Add a 3D panel, set its display frame to "lidar",', flush=True)
     print('and enable /lidar, /detections, /ground_truth, and /ego_vehicle.',
           flush=True)
+    print('Elevation heatmaps sit on the road: /elevation/ground,', flush=True)
+    print('/elevation/slope, /elevation/obstacle. Set Elevation field to',
+          flush=True)
+    print('elevation so each bin shows how far the ground rises.', flush=True)
     if camera_channels:
         print('Image panels: ' + ', '.join(
             f'/{name}' for name in camera_channels), flush=True)
@@ -1068,12 +1202,7 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
           flush=True)
     print('z=0 is the sensor, about 1.7 m above the road.', flush=True)
     while True:
-        points.log(pointcloud)
-        detections.log(scene)
-        ground_truth.log(gt_scene)
-        ego_vehicle.log(ego_scene)
-        for name, message in cameras.items():
-            camera_channels[name].log(message)
+        _log_once()
         time.sleep(1.0)
 
 
@@ -1128,9 +1257,12 @@ def main():
     else:
         xyz, rgb, boxes, cameras = load_scene(
             args.pcd, args.detections, args.ann, args.img_dir, args.max_points)
+    key_xyz = load_lidar_xyz(_existing_lidar_path(args.pcd))
+    grids = make_elevation_grids(estimate_elevation_grid(key_xyz))
     serve(
         make_pointcloud(xyz, rgb), make_scene(boxes), args.host, args.port,
-        gt_scene=make_gt_scene(gt_boxes), once=args.once, cameras=cameras)
+        gt_scene=make_gt_scene(gt_boxes), once=args.once, cameras=cameras,
+        grids=grids)
 
 
 if __name__ == '__main__':
