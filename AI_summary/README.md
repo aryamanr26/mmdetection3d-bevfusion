@@ -11,6 +11,13 @@ not duplicated here.
 
 ## Commits
 
+- [Tracking evaluation and latency](2026-10-25-tracking-evaluation.md)
+  — Poly-MOT-style tracker versus a constant-velocity baseline on all ten
+  mini scenes, a 0.05 track-start threshold, GPU camera colorization, and a
+  per-stage latency benchmark: 422 ms mean and 449 ms p95 per full frame.
+- [Training-free 3D tracking](2026-10-25-bevfusion-tracking.md)
+  — global-frame class-aware Kalman tracking, official nuScenes mini-val
+  evaluation, motion forecasts, and Foxglove track visualization.
 - [Failure-analysis report](2026-10-19-failure-analysis-report.md)
   — unique per-object diagnostics, tag co-occurrence, miss mechanisms, and
   confidence-threshold curves for the Foxglove scene.

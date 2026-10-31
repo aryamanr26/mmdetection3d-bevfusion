@@ -1,4 +1,5 @@
 lyft_dataset_sdk
+motmetrics==1.4.0
 networkx>=2.5
 numba # you should install numba==0.53.0 if your environment is cuda-9.0
 numpy

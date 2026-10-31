@@ -17,7 +17,8 @@ Example:
 
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
-``lidar`` and enable ``/lidar``, ``/detections``, and ``/ego_vehicle``. The
+``lidar`` and enable ``/lidar``, ``/detections``, ``/tracks``, and
+``/ego_vehicle``. The
 keyframe elevation map is on ``/elevation/ground``, ``/elevation/slope``, and
 ``/elevation/obstacle``. The grid plane is the road under the vehicle. Set
 the color mode to RGBA (separate fields) and the elevation field to
@@ -26,6 +27,7 @@ its original JPEG on ``/CAM_FRONT``, ``/CAM_FRONT_LEFT``, and the other four
 ``/CAM_*`` topics.
 """
 import argparse
+import colorsys
 import math
 import os
 import pickle
@@ -45,6 +47,9 @@ from multi_modality_demo import (  # noqa: E402
     lidar_box_corners, load_lidar_xyz)
 from elevation_grid import (  # noqa: E402
     GROUND_HINT_Z, estimate_elevation_grid, layer_rgba)
+from tracker import (  # noqa: E402
+    MultiObjectTracker, inverse_transform_box, transform_detection,
+    transform_matrix)
 
 import foxglove  # noqa: E402
 from foxglove.channels import (  # noqa: E402
@@ -53,9 +58,9 @@ from foxglove.websocket import (  # noqa: E402
     Capability, PlaybackCommand, PlaybackControlRequest, PlaybackState,
     PlaybackStatus, ServerListener)
 from foxglove.messages import (  # noqa: E402
-    Color, CompressedImage, CubePrimitive, LinePrimitive, LinePrimitiveLineType,
-    Grid, PackedElementField, PackedElementFieldNumericType, Point3, PointCloud,
-    Pose, Quaternion, SceneEntity, SceneEntityDeletion,
+    Color, CompressedImage, CubePrimitive, Grid, KeyValuePair, LinePrimitive,
+    LinePrimitiveLineType, PackedElementField, PackedElementFieldNumericType,
+    Point3, PointCloud, Pose, Quaternion, SceneEntity, SceneEntityDeletion,
     SceneEntityDeletionType, SceneUpdate, TextPrimitive, Timestamp, Vector2,
     Vector3)
 
@@ -312,7 +317,9 @@ def _pack_model_inputs(dataset, info, points, cameras, cache):
     results = info
     results['points'] = LiDARPoints(
         points.copy(), points_dim=points.shape[1])
-    results['img'] = [image.astype(np.float32) for image in cameras['images']]
+    # ImageAug3D casts each image to uint8 before resizing, so the decoded
+    # uint8 arrays give the same network input as a float32 copy.
+    results['img'] = list(cameras['images'])
     results['img_path'] = list(cameras['paths'])
     results['filename'] = results['img_path']
     results['cam2img'] = cameras['cam2img'].copy()
@@ -450,14 +457,16 @@ def infer_loaded(model, dataset, index, score_thr, class_names, sweeps_num=9,
         pred = result.pred_instances_3d
         keep = pred.scores_3d >= score_thr
         labels = pred.labels_3d[keep].detach().cpu().numpy().astype(int)
+        scores = pred.scores_3d[keep].detach().cpu().numpy()
         bboxes = pred.bboxes_3d.tensor[keep].detach().cpu().numpy()
     motions = classify_detections(labels, bboxes, class_names)
     boxes = [{
         'label': int(label),
         'class_name': motion['class_name'],
         'motion': motion['motion'],
+        'score': float(score),
         'bbox_3d': bbox.tolist(),
-    } for label, bbox, motion in zip(labels, bboxes, motions)]
+    } for label, score, bbox, motion in zip(labels, scores, bboxes, motions)]
     display_xyz = np.ascontiguousarray(points[:, :3])
     meta = {
         'lidar2img': cameras['lidar2img'],
@@ -490,7 +499,7 @@ def _subsample(xyz, rgb, max_points):
 
 
 def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
-                         score_thr, max_points, cache):
+                         score_thr, max_points, cache, tracker=None):
     """Infer one keyframe and pack synchronized Foxglove messages."""
     boxes, images, meta, xyz = infer_loaded(
         model, dataset, index, score_thr, class_names, sweeps_num, cache)
@@ -507,16 +516,25 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
     elevation = estimate_elevation_grid(key[:, :3])
     time_ns = int(float(info['timestamp']) * 1_000_000_000)
     elevation_grids = make_elevation_grids(elevation, time_ns)
+    tracks = []
+    if tracker is not None:
+        lidar2global = transform_matrix(info)
+        global_detections = [
+            transform_detection(box, lidar2global) for box in boxes]
+        global_tracks = tracker.step(global_detections, float(info['timestamp']))
+        tracks = tracks_to_lidar(global_tracks, lidar2global)
     return {
         'time': time_ns,
         'cloud': make_pointcloud(xyz, rgb),
         'detections': make_scene(boxes, replace=True),
+        'tracks': make_track_scene(tracks, replace=True),
         'ground_truth': make_gt_scene(gt_boxes, replace=True),
         'ego_vehicle': make_ego_scene(replace=True),
         'cameras': make_camera_images(
             meta.get('camera_names', []), meta.get('camera_jpeg', [])),
         'elevation': elevation_grids,
         'predictions': len(boxes),
+        'track_count': len(tracks),
         'ground_truth_count': len(gt_boxes),
         'points': len(xyz),
         'elevation_ms': (time.perf_counter() - grid_started) * 1e3,
@@ -616,10 +634,11 @@ class _PlaybackListener(ServerListener):
             )
 
 
-def _publish_frame(points, detections, ground_truth, ego_vehicle,
+def _publish_frame(points, detections, tracks, ground_truth, ego_vehicle,
                    camera_channels, elevation_channels, frame):
     points.log(frame['cloud'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
+    tracks.log(frame['tracks'], log_time=frame['time'])
     ground_truth.log(frame['ground_truth'], log_time=frame['time'])
     # Build ego live so orientation/dimension tweaks do not require re-inference.
     ego_vehicle.log(make_ego_scene(replace=True), log_time=frame['time'])
@@ -652,6 +671,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     sensors = _SensorCache()
     points = PointCloudChannel('/lidar')
     detections = SceneUpdateChannel('/detections')
+    track_channel = SceneUpdateChannel('/tracks')
     ground_truth = SceneUpdateChannel('/ground_truth')
     ego_vehicle = SceneUpdateChannel('/ego_vehicle')
     elevation_channels = _elevation_channels()
@@ -672,6 +692,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('the last frame instead of looping. Drag the timeline to seek.',
           flush=True)
     print('Enable /ego_vehicle for the cyan self-driving-car box.', flush=True)
+    print('Enable /tracks for stable IDs, velocity arrows, 2 s history, and '
+          '3 s forecasts.', flush=True)
     print('Elevation heatmaps sit on the road: /elevation/ground,', flush=True)
     print('/elevation/slope, /elevation/obstacle. Set Elevation field to',
           flush=True)
@@ -680,14 +702,16 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
           flush=True)
 
     frames = []
+    tracker = MultiObjectTracker(low_score=score_thr)
     for number, (index, info, name) in enumerate(rows, 1):
         started = time.perf_counter()
         frame = build_playback_frame(
             model, dataset, class_names, info, index, sweeps_num, score_thr,
-            max_points, sensors)
+            max_points, sensors, tracker=tracker)
         frames.append(frame)
         print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
-              f'{frame["predictions"]} pred, {frame["ground_truth_count"]} GT, '
+              f'{frame["predictions"]} pred, {frame["track_count"]} tracks, '
+              f'{frame["ground_truth_count"]} GT, '
               f'grid {frame["elevation_ms"]:.0f} ms, '
               f'{time.perf_counter() - started:.1f}s', flush=True)
     sensors.release_points()
@@ -716,7 +740,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         now = time.perf_counter()
         if index != published or now - last_pub >= 0.5:
             _publish_frame(
-                points, detections, ground_truth, ego_vehicle,
+                points, detections, track_channel, ground_truth, ego_vehicle,
                 camera_channels, elevation_channels, frame)
             server.broadcast_time(current)
             published = player.index
@@ -936,6 +960,181 @@ def _box_color(box):
     label = int(box.get('label', 0))
     class_color = CLASS_COLORS[label % len(CLASS_COLORS)]
     return motion_color(box.get('motion', 'static'), class_color, 'motion')
+
+
+def tracks_to_lidar(tracks, lidar2global):
+    """Convert global track boxes, histories, and forecasts for display."""
+    inverse = np.linalg.inv(np.asarray(lidar2global, dtype=np.float64))
+
+    def points_to_lidar(rows, z):
+        if not rows:
+            return []
+        rows = np.asarray(rows, dtype=np.float64)
+        xyz = np.column_stack((rows[:, 1:3], np.full(len(rows), z)))
+        local = xyz @ inverse[:3, :3].T + inverse[:3, 3]
+        return np.column_stack((rows[:, 0], local)).tolist()
+
+    converted = []
+    for track in tracks:
+        item = dict(track)
+        item['bbox_3d'] = inverse_transform_box(
+            track['bbox_3d'], lidar2global).tolist()
+        z = float(track['bbox_3d'][2])
+        item['history'] = points_to_lidar(track.get('history', []), z)
+        item['forecast'] = points_to_lidar(track.get('forecast', []), z)
+        converted.append(item)
+    return converted
+
+
+def _track_color(track_id, class_name=None):
+    """Use the detector's class color, with a stable ID-color fallback."""
+    if class_name in CLASS_NAMES:
+        return CLASS_COLORS[CLASS_NAMES.index(class_name)]
+    try:
+        value = int(track_id)
+    except ValueError:
+        value = sum(map(ord, str(track_id)))
+    return colorsys.hsv_to_rgb((value * 0.61803398875) % 1.0, 0.75, 1.0)
+
+
+def _line_strip(points, color, thickness, dashed=False):
+    if len(points) < 2:
+        return None
+    # Foxglove has no dashed line primitive. Alternating forecast segments
+    # make the future visually distinct from the continuous history.
+    line_type = (LinePrimitiveLineType.LineList
+                 if dashed else LinePrimitiveLineType.LineStrip)
+    if dashed:
+        segments = []
+        for index in range(0, len(points) - 1, 2):
+            segments.extend((points[index], points[index + 1]))
+        points = segments
+    return LinePrimitive(
+        type=line_type,
+        pose=_IDENTITY,
+        thickness=thickness,
+        scale_invariant=False,
+        points=points,
+        color=color,
+        colors=[],
+        indices=[],
+    )
+
+
+def make_track_scene(tracks, replace=False):
+    """Render IDs, filtered motion, history, and forecasts for tracks."""
+    entities = []
+    corners = lidar_box_corners(
+        [track['bbox_3d'] for track in tracks]
+    ) if tracks else np.zeros((0, 8, 3))
+    for index, track in enumerate(tracks):
+        box = np.asarray(track['bbox_3d'], dtype=np.float64)
+        r, g, b = _track_color(
+            track['tracking_id'], track.get('class_name'))
+        color = Color(r=r, g=g, b=b, a=1.0)
+        edge_points = []
+        for first, second in BOX_EDGES:
+            for corner in (first, second):
+                edge_points.append(Point3(
+                    x=float(corners[index, corner, 0]),
+                    y=float(corners[index, corner, 1]),
+                    z=float(corners[index, corner, 2]),
+                ))
+        center_z = float(box[2] + 0.5 * box[5])
+        velocity_points = [
+            Point3(x=float(box[0]), y=float(box[1]), z=center_z),
+            Point3(
+                x=float(box[0] + box[7]),
+                y=float(box[1] + box[8]),
+                z=center_z),
+        ]
+        history_points = [
+            Point3(x=float(row[1]), y=float(row[2]), z=center_z)
+            for row in track.get('history', [])]
+        forecast_points = [
+            Point3(x=float(row[1]), y=float(row[2]), z=center_z)
+            for row in track.get('forecast', [])]
+        lines = [
+            LinePrimitive(
+                type=LinePrimitiveLineType.LineList,
+                pose=_IDENTITY,
+                thickness=0.07,
+                scale_invariant=False,
+                points=edge_points,
+                color=color,
+                colors=[],
+                indices=[],
+            ),
+            LinePrimitive(
+                type=LinePrimitiveLineType.LineList,
+                pose=_IDENTITY,
+                thickness=0.11,
+                scale_invariant=False,
+                points=velocity_points,
+                color=color,
+                colors=[],
+                indices=[],
+            ),
+        ]
+        history_line = _line_strip(history_points, color, 0.08)
+        forecast_line = _line_strip(forecast_points, color, 0.06, dashed=True)
+        lines.extend(line for line in (history_line, forecast_line)
+                     if line is not None)
+        state = 'moving' if track.get('moving') else 'static'
+        entities.append(SceneEntity(
+            frame_id=FRAME_ID,
+            id=f'track_{track["tracking_id"]}',
+            metadata=[
+                KeyValuePair(
+                    key='class', value=str(track['class_name'])),
+                KeyValuePair(
+                    key='speed',
+                    value=f'{track["speed_mps"]:.2f} m/s'),
+                KeyValuePair(key='motion', value=state),
+                KeyValuePair(
+                    key='direction', value=str(track['direction'])),
+                KeyValuePair(
+                    key='yaw rate',
+                    value=f'{track["yaw_rate_rps"]:.2f} rad/s'),
+                KeyValuePair(
+                    key='acceleration',
+                    value=f'{track["acceleration_mps2"]:.2f} m/s²'),
+                KeyValuePair(
+                    key='confidence', value=f'{track["score"]:.3f}'),
+                KeyValuePair(
+                    key='coasted', value=str(bool(track.get('coasted')))),
+            ],
+            cubes=[CubePrimitive(
+                pose=Pose(
+                    position=Vector3(
+                        x=float(box[0]), y=float(box[1]), z=center_z),
+                    orientation=_yaw_quaternion(box[6]),
+                ),
+                size=Vector3(
+                    x=float(box[3]), y=float(box[4]), z=float(box[5])),
+                color=Color(r=r, g=g, b=b, a=0.18),
+            )],
+            lines=lines,
+            texts=[TextPrimitive(
+                pose=Pose(
+                    position=Vector3(
+                        x=float(box[0]), y=float(box[1]),
+                        z=float(box[2] + box[5] + 0.3)),
+                    orientation=Quaternion(
+                        x=0.0, y=0.0, z=0.0, w=1.0),
+                ),
+                billboard=True,
+                font_size=11,
+                scale_invariant=True,
+                color=color,
+                text=f'#{track["tracking_id"]}',
+            )],
+        ))
+    return SceneUpdate(
+        deletions=([SceneEntityDeletion(type=SceneEntityDeletionType.All)]
+                   if replace else []),
+        entities=entities,
+    )
 
 
 def make_scene(boxes, replace=False):

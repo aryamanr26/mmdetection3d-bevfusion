@@ -143,12 +143,96 @@ def boost_saturation(rgb: np.ndarray, factor: float = 2.2) -> np.ndarray:
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return torch.cuda.is_available()
+
+
+def _colorize_lidar_torch(points_lidar, images, lidar2img, min_depth,
+                          border_margin_px, default_rgb, device):
+    """``colorize_lidar`` on a torch device; same float64 math and output."""
+    import torch
+
+    n = len(points_lidar)
+    pts = torch.as_tensor(points_lidar[:, :3], device=device)
+    pts_h = torch.cat(
+        [pts, torch.ones((n, 1), dtype=torch.float64, device=device)], dim=1)
+    rgb = torch.tensor(default_rgb, dtype=torch.uint8,
+                       device=device).repeat(n, 1)
+    best_score = torch.full((n,), -float('inf'), dtype=torch.float64,
+                            device=device)
+    colored = torch.zeros(n, dtype=torch.bool, device=device)
+    margin = border_margin_px
+    for cam_idx, img in enumerate(images):
+        if cam_idx >= len(lidar2img):
+            break
+        mat4 = _as_4x4(lidar2img[cam_idx])
+        if mat4 is None or img is None:
+            continue
+        img = np.asarray(img)
+        if img.ndim != 3 or img.shape[2] < 3:
+            continue
+        if img.dtype != np.uint8 and img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        h, w = img.shape[:2]
+
+        proj = pts_h @ torch.as_tensor(mat4, device=device).T
+        depth = proj[:, 2]
+        safe = torch.where(depth.abs() < 1e-6,
+                           torch.full_like(depth, 1e-6), depth)
+        u = proj[:, 0] / safe
+        v = proj[:, 1] / safe
+        valid = ((depth > min_depth) & (u >= margin) & (u < w - margin)
+                 & (v >= margin) & (v < h - margin))
+        idx = torch.nonzero(valid).squeeze(1)
+        if idx.numel() == 0:
+            continue
+        u, v, depth = u[idx], v[idx], depth[idx]
+
+        # Depth-tolerant z-buffer, as in ``_zbuffer_keep``.
+        ui = torch.round(u).long().clamp(0, w - 1)
+        vi = torch.round(v).long().clamp(0, h - 1)
+        keys = vi * w + ui
+        min_depth_px = torch.full((h * w,), float('inf'),
+                                  dtype=torch.float64, device=device)
+        min_depth_px.scatter_reduce_(0, keys, depth, reduce='amin')
+        nearest = min_depth_px[keys]
+        keep = depth <= torch.maximum(nearest * 1.3, nearest + 1.0)
+        idx, u, v, depth = idx[keep], u[keep], v[keep], depth[keep]
+        ui, vi = ui[keep], vi[keep]
+        if idx.numel() == 0:
+            continue
+
+        dx = (u - w * 0.5) / (w * 0.5)
+        dy = (v - h * 0.5) / (h * 0.5)
+        scores = (0.8 * (1.0 - torch.sqrt(dx * dx + dy * dy).clamp(0.0, 1.0))
+                  + 0.2 * (1.0 / (1.0 + depth.clamp(min=0.0))))
+        better = scores > best_score[idx]
+        upd = idx[better]
+        if upd.numel() == 0:
+            continue
+        img_t = torch.as_tensor(img, device=device)
+        rgb[upd] = img_t[vi[better], ui[better], :3]
+        best_score[upd] = scores[better]
+        colored[upd] = True
+
+    rgb = rgb.cpu().numpy()
+    colored = colored.cpu().numpy()
+    if colored.any():
+        rgb[colored] = boost_saturation(rgb[colored])
+    return rgb, colored
+
+
 def colorize_lidar(points_lidar: np.ndarray,
                    images: Sequence[np.ndarray],
                    lidar2img: Sequence[np.ndarray],
                    min_depth: float = 1.0,
                    border_margin_px: int = 0,
-                   default_rgb: Sequence[int] = DEFAULT_LIDAR_RGB):
+                   default_rgb: Sequence[int] = DEFAULT_LIDAR_RGB,
+                   device: Optional[str] = None):
     """Return per-point RGB by sampling camera images; XYZ stays LiDAR-frame.
 
     Args:
@@ -159,6 +243,9 @@ def colorize_lidar(points_lidar: np.ndarray,
         min_depth: minimum camera-frame depth (m) to accept a projection.
         border_margin_px: reject pixels within this many px of the image edge.
         default_rgb: color for points seen by no camera.
+        device: ``'cpu'`` for NumPy, or a torch device such as ``'cuda'``.
+            ``None`` uses CUDA when it is available. Both give the same
+            colors.
 
     Returns:
         ``(rgb, colored_mask)`` where ``rgb`` is ``(N, 3)`` uint8 aligned with
@@ -172,6 +259,12 @@ def colorize_lidar(points_lidar: np.ndarray,
     colored_mask = np.zeros(n, dtype=bool)
     if n == 0:
         return rgb, colored_mask
+    if device is None:
+        device = 'cuda' if _cuda_available() else 'cpu'
+    if device != 'cpu':
+        return _colorize_lidar_torch(
+            points_lidar, images, lidar2img, min_depth, border_margin_px,
+            default_rgb, device)
 
     for cam_idx, img in enumerate(images):
         if cam_idx >= len(lidar2img):
