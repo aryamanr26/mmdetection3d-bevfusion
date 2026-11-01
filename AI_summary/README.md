@@ -11,6 +11,16 @@ not duplicated here.
 
 ## Commits
 
+- [MapTRv2 accuracy, elevation, and 2 Hz sidecar](2026-10-31-maptr-accuracy-elevation-async.md)
+  — map expansion v1.3 on scene-0103 and scene-0916, class-wise chamfer,
+  elevation-grid Z on lane points, and a pinned 2 Hz Docker worker.
+  BEVFusion full-frame p95 is 635 ms, still above 500 ms.
+- [Pretrained lane perception evaluation](2026-10-31-lane-perception-eval.md)
+  — LaneSegNet versus MapTRv2, and the official MapTRv2 nuScenes centerline
+  checkpoint run standalone on all mini keyframes in an isolated Docker
+  environment: lane polylines with scores, fork and merge connectivity,
+  Foxglove on port 8766, 76 ms network time, and the measured cost of
+  running it next to BEVFusion.
 - [Tracking evaluation and latency](2026-10-25-tracking-evaluation.md)
   — Poly-MOT-style tracker versus a constant-velocity baseline on all ten
   mini scenes, a 0.05 track-start threshold, GPU camera colorization, and a

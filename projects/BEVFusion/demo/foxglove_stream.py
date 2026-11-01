@@ -18,7 +18,8 @@ Example:
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
 ``lidar`` and enable ``/lidar``, ``/detections``, ``/tracks``, and
-``/ego_vehicle``. The
+``/ego_vehicle``. Saved MapTRv2 lanes, when present, are on ``/lane_map``
+and ``/lane_graph``. The
 keyframe elevation map is on ``/elevation/ground``, ``/elevation/slope``, and
 ``/elevation/obstacle``. The grid plane is the road under the vehicle. Set
 the color mode to RGBA (separate fields) and the elevation field to
@@ -533,6 +534,7 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
         'cameras': make_camera_images(
             meta.get('camera_names', []), meta.get('camera_jpeg', [])),
         'elevation': elevation_grids,
+        'elevation_grid': elevation,
         'predictions': len(boxes),
         'track_count': len(tracks),
         'ground_truth_count': len(gt_boxes),
@@ -635,7 +637,8 @@ class _PlaybackListener(ServerListener):
 
 
 def _publish_frame(points, detections, tracks, ground_truth, ego_vehicle,
-                   camera_channels, elevation_channels, frame):
+                   camera_channels, elevation_channels, frame,
+                   lane_channels=None):
     points.log(frame['cloud'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
     tracks.log(frame['tracks'], log_time=frame['time'])
@@ -648,6 +651,70 @@ def _publish_frame(points, detections, tracks, ground_truth, ego_vehicle,
             channel.log(message, log_time=frame['time'])
     for kind, channel in elevation_channels.items():
         channel.log(frame['elevation'][kind], log_time=frame['time'])
+    if lane_channels is not None and 'lane_map' in frame:
+        lane_channels['map'].log(frame['lane_map'], log_time=frame['time'])
+        lane_channels['graph'].log(frame['lane_graph'], log_time=frame['time'])
+    hd_map = frame.get('hd_map')
+    if hd_map is not None and lane_channels is not None and 'hd' in lane_channels:
+        lane_channels['hd'].log(hd_map, log_time=frame['time'])
+
+
+def _centerline_graph(elements):
+    """Rebuild connectivity from the lines as they are posed in this frame."""
+    from centerline_graph import build_centerline_graph
+    center = [element for element in elements if element.get('cls') == 'centerline']
+    graph = build_centerline_graph([element['points'] for element in center])
+    ids = [element['id'] for element in center]
+    for edge in graph['edges']:
+        edge['lane'] = ids[edge['lane']]
+    for key in ('successors', 'forks', 'merges'):
+        graph[key] = [[ids[i], ids[j]] for i, j in graph[key]]
+    return graph
+
+
+def _attach_lanes(frame, info, lane_index, hold, score_thr, make_map, make_graph):
+    """Hold lane estimates at 2 Hz and give them the current ground height."""
+    from elevation_grid import sample_ground
+    from lane_elevation import assign_elevation
+    from tracker import transform_matrix
+
+    token = info.get('token')
+    pose = transform_matrix(info)
+    timestamp = float(info['timestamp'])
+    saved = lane_index.get(token)
+    if saved is not None:
+        fresh = [element for element in saved['elements']
+                 if element['score'] >= score_thr]
+        if hold.record is None or timestamp - hold.record['time'] >= 0.5:
+            hold.update(hold.record['seq'] + 1 if hold.record else 1,
+                        timestamp, pose, fresh)
+    view = hold.query(pose, timestamp)
+    if view is None or view['stale']:
+        stamped = dict(timestamp=timestamp, elements=[],
+                       age_s=None if view is None else view['age_s'],
+                       stale=True)
+    else:
+        lifted = assign_elevation(
+            view['elements'],
+            lambda xy: sample_ground(frame['elevation_grid'], xy))
+        stamped = dict(
+            timestamp=timestamp, elements=lifted, age_s=view['age_s'],
+            estimate_time=view['estimate_time'], seq=view['seq'], stale=False,
+            centerline_graph=_centerline_graph(lifted))
+    frame['lane_map'] = make_map(stamped, score_thr)
+    frame['lane_graph'] = make_graph(stamped)
+
+
+def _load_lane_predictions(pred_dir):
+    """Saved MapTRv2 frames keyed by nuScenes sample token, or an empty dict."""
+    if not pred_dir or not os.path.isdir(pred_dir):
+        return {}
+    lane_root = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..', '..', 'LaneMapping'))
+    if lane_root not in sys.path:
+        sys.path.insert(0, lane_root)
+    from lane_foxglove import load_predictions
+    return load_predictions(pred_dir)
 
 
 def _camera_channels(names):
@@ -655,8 +722,24 @@ def _camera_channels(names):
     return {name: CompressedImageChannel(f'/{name}') for name in names}
 
 
+def _attach_hd_map(frame, info, nusc_map):
+    """Draw the nuScenes map expansion in this LiDAR frame."""
+    from elevation_grid import sample_ground
+    from hdmap_foxglove import local_map, make_hd_map
+    from tracker import transform_matrix
+
+    layers = local_map(nusc_map, transform_matrix(info))
+    grid = frame['elevation_grid']
+    frame['hd_map'] = make_hd_map(
+        float(info['timestamp']), layers,
+        lambda xy: sample_ground(grid, xy),
+        _road_origin_z(grid))
+    frame['hd_counts'] = {name: len(lines) for name, lines in layers.items()}
+
+
 def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
-               score_thr, max_points, host, port):
+               score_thr, max_points, host, port, lane_pred_dir=None,
+               lane_score_thr=0.3, dataroot='data/nuscenes', hd_map=True):
     """Infer a full scene, then play it under Foxglove's timeline controls."""
     with open(infos_path, 'rb') as f:
         data_list = pickle.load(f)['data_list']
@@ -700,6 +783,35 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('elevation so each bin shows how far the ground rises.', flush=True)
     print('Image panels: ' + ', '.join(f'/{name}' for name in camera_names),
           flush=True)
+    lane_root = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..', '..', 'LaneMapping'))
+    if lane_root not in sys.path:
+        sys.path.insert(0, lane_root)
+    lane_index = _load_lane_predictions(lane_pred_dir)
+    lane_channels = None
+    lane_hold = None
+    nusc_map = None
+    if lane_index or hd_map:
+        lane_channels = {}
+    if lane_index:
+        from lane_foxglove import make_lane_graph, make_lane_map
+        from lane_motion import LaneHold
+        lane_channels['map'] = SceneUpdateChannel('/lane_map')
+        lane_channels['graph'] = SceneUpdateChannel('/lane_graph')
+        lane_hold = LaneHold(stale_s=2.0)
+        matched = sum(info.get('token') in lane_index for _, info, _ in rows)
+        print(f'Lanes from {lane_pred_dir}: {matched}/{len(rows)} frames, '
+              f'score >= {lane_score_thr}, held at 2 Hz and lifted onto the '
+              f'elevation grid, on /lane_map and /lane_graph',
+              flush=True)
+    if hd_map:
+        from hdmap_foxglove import load_map, map_location
+        location = map_location(dataroot, log)
+        nusc_map = load_map(dataroot, location)
+        lane_channels['hd'] = SceneUpdateChannel('/hd_map')
+        print(f'HD map {location} on /hd_map: lane markings, intersection '
+              f'centerlines, and traffic lights, ±50 m in the lidar frame',
+              flush=True)
 
     frames = []
     tracker = MultiObjectTracker(low_score=score_thr)
@@ -708,12 +820,22 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         frame = build_playback_frame(
             model, dataset, class_names, info, index, sweeps_num, score_thr,
             max_points, sensors, tracker=tracker)
+        if lane_hold is not None:
+            _attach_lanes(frame, info, lane_index, lane_hold, lane_score_thr,
+                          make_lane_map, make_lane_graph)
+        if nusc_map is not None:
+            _attach_hd_map(frame, info, nusc_map)
         frames.append(frame)
+        hd_note = ''
+        if number == 1 and frame.get('hd_counts'):
+            present = [f'{name} {count}' for name, count
+                       in frame['hd_counts'].items() if count]
+            hd_note = ' | hd ' + ', '.join(present)
         print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
               f'{frame["predictions"]} pred, {frame["track_count"]} tracks, '
               f'{frame["ground_truth_count"]} GT, '
               f'grid {frame["elevation_ms"]:.0f} ms, '
-              f'{time.perf_counter() - started:.1f}s', flush=True)
+              f'{time.perf_counter() - started:.1f}s{hd_note}', flush=True)
     sensors.release_points()
 
     with lock:
@@ -741,7 +863,7 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         if index != published or now - last_pub >= 0.5:
             _publish_frame(
                 points, detections, track_channel, ground_truth, ego_vehicle,
-                camera_channels, elevation_channels, frame)
+                camera_channels, elevation_channels, frame, lane_channels)
             server.broadcast_time(current)
             published = player.index
             last_pub = now
@@ -1431,8 +1553,16 @@ def parse_args():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument(
+        '--lane-preds',
+        default='demo/eval_out/lane_perception/centerline/preds',
+        help='saved MapTRv2 predictions; a missing directory skips lanes')
+    parser.add_argument('--lane-score-thr', type=float, default=0.3)
+    parser.add_argument(
         '--play-scene', action='store_true',
         help='infer every keyframe in this log, then replay it in order')
+    parser.add_argument(
+        '--no-hd-map', action='store_true',
+        help='do not draw the nuScenes map expansion on /hd_map')
     parser.add_argument(
         '--once', action='store_true',
         help='write one MCAP to /tmp and exit instead of serving')
@@ -1445,7 +1575,8 @@ def main():
         play_scene(
             os.path.basename(args.pcd), args.infos, args.sweeps, args.config,
             args.checkpoint, args.score_thr, args.max_points, args.host,
-            args.port)
+            args.port, args.lane_preds, args.lane_score_thr,
+            hd_map=not args.no_hd_map)
         return
     gt_boxes = []
     cameras = {}

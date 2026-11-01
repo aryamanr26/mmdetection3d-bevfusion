@@ -447,6 +447,24 @@ def estimate_elevation_grid(points):
     )
 
 
+def sample_ground(grid, xy):
+    """Ground height of XY points in the same LiDAR frame as the grid.
+
+    ``grid.ground`` is the fitted surface height, not an offset from a fixed
+    plane. Cells outside the grid or without a fit are NaN. The returned
+    mask is False for those points, and their height is not filled in.
+    """
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    ix = np.floor((xy[:, 0] - grid.x_min) / grid.resolution).astype(np.int32)
+    iy = np.floor((xy[:, 1] - grid.y_min) / grid.resolution).astype(np.int32)
+    inside = (ix >= 0) & (ix < grid.size) & (iy >= 0) & (iy < grid.size)
+    height = np.full(len(xy), np.nan, dtype=np.float64)
+    if np.any(inside):
+        height[inside] = grid.ground[iy[inside], ix[inside]]
+    valid = np.isfinite(height)
+    return height, valid
+
+
 def _colormap(values, show, vmin, vmax, name, alpha):
     from matplotlib import colormaps
 
