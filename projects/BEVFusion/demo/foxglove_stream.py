@@ -1,9 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Stream one BEVFusion scene to Foxglove over a local WebSocket.
 
-The Foxglove browser app connects to this process and renders the
-camera-colored LiDAR cloud plus oriented detection boxes. Nothing is uploaded
-to Foxglove's servers: the browser pulls the stream from this machine.
+The Foxglove browser app connects to this process and renders the gray
+LiDAR sweep plus oriented detection boxes. Nothing is uploaded to
+Foxglove's servers: the browser pulls the stream from this machine.
 
 By default the cloud is the keyframe plus the nine previous LiDAR sweeps used
 by BEVFusion, transformed into the keyframe LiDAR frame. Those sweeps and the
@@ -18,7 +18,9 @@ Example:
 Then open https://app.foxglove.dev, choose Open connection, Foxglove WebSocket,
 and accept ws://localhost:8765. In a 3D panel, set the display frame to
 ``lidar`` and enable ``/lidar``, ``/detections``, ``/tracks``, and
-``/ego_vehicle``. Saved MapTRv2 lanes, when present, are on ``/lane_map``
+``/ego_vehicle``. ``/lidar`` is the gray sweep. Camera-colored LiDAR is
+optional on ``/lidar_color``. Saved SparseOcc voxels, when present, are
+on ``/occupancy``. Saved MapTRv2 lanes, when present, are on ``/lane_map``
 and ``/lane_graph``. The
 keyframe elevation map is on ``/elevation/ground``, ``/elevation/slope``, and
 ``/elevation/obstacle``. The grid plane is the road under the vehicle. Set
@@ -509,6 +511,8 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
         rgb = np.repeat(np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None],
                         len(xyz), axis=0)
     xyz, rgb = _subsample(xyz, rgb, max_points)
+    gray = np.repeat(
+        np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None], len(xyz), axis=0)
     gt_boxes = gt_boxes_from_info(
         info, class_names=class_names,
         metainfo=getattr(dataset, 'metainfo', None))
@@ -526,7 +530,8 @@ def build_playback_frame(model, dataset, class_names, info, index, sweeps_num,
         tracks = tracks_to_lidar(global_tracks, lidar2global)
     return {
         'time': time_ns,
-        'cloud': make_pointcloud(xyz, rgb),
+        'cloud': make_pointcloud(xyz, gray),
+        'cloud_color': make_pointcloud(xyz, rgb),
         'detections': make_scene(boxes, replace=True),
         'tracks': make_track_scene(tracks, replace=True),
         'ground_truth': make_gt_scene(gt_boxes, replace=True),
@@ -638,8 +643,10 @@ class _PlaybackListener(ServerListener):
 
 def _publish_frame(points, detections, tracks, ground_truth, ego_vehicle,
                    camera_channels, elevation_channels, frame,
-                   lane_channels=None):
+                   lane_channels=None, color_points=None, occupancy=None):
     points.log(frame['cloud'], log_time=frame['time'])
+    if color_points is not None and 'cloud_color' in frame:
+        color_points.log(frame['cloud_color'], log_time=frame['time'])
     detections.log(frame['detections'], log_time=frame['time'])
     tracks.log(frame['tracks'], log_time=frame['time'])
     ground_truth.log(frame['ground_truth'], log_time=frame['time'])
@@ -651,6 +658,8 @@ def _publish_frame(points, detections, tracks, ground_truth, ego_vehicle,
             channel.log(message, log_time=frame['time'])
     for kind, channel in elevation_channels.items():
         channel.log(frame['elevation'][kind], log_time=frame['time'])
+    if occupancy is not None and 'occupancy' in frame:
+        occupancy.log(frame['occupancy'], log_time=frame['time'])
     if lane_channels is not None and 'lane_map' in frame:
         lane_channels['map'].log(frame['lane_map'], log_time=frame['time'])
         lane_channels['graph'].log(frame['lane_graph'], log_time=frame['time'])
@@ -705,6 +714,39 @@ def _attach_lanes(frame, info, lane_index, hold, score_thr, make_map, make_graph
     frame['lane_graph'] = make_graph(stamped)
 
 
+def _resolve_occ_dir(occ_dir):
+    """Accept a path relative to cwd or the repo root."""
+    if not occ_dir:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.normpath(os.path.join(here, '..', '..', '..'))
+    candidates = [occ_dir]
+    if not os.path.isabs(occ_dir):
+        candidates.append(os.path.join(repo, occ_dir))
+        candidates.append(os.path.join(here, occ_dir))
+    for path in candidates:
+        if os.path.isdir(path):
+            return os.path.abspath(path)
+    return None
+
+
+def _occupancy_attach():
+    occ_root = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..', '..',
+        'OccupancyFusion'))
+    if occ_root not in sys.path:
+        sys.path.insert(0, occ_root)
+    from occupancy_foxglove import attach_occupancy
+    return attach_occupancy
+
+
+def _attach_occupancy(frame, info, occ_dir, attach=None):
+    """Join saved SparseOcc voxels on ``sample_token``. Missing files are skipped."""
+    if attach is None:
+        attach = _occupancy_attach()
+    attach(frame, info.get('token'), occ_dir)
+
+
 def _load_lane_predictions(pred_dir):
     """Saved MapTRv2 frames keyed by nuScenes sample token, or an empty dict."""
     if not pred_dir or not os.path.isdir(pred_dir):
@@ -739,7 +781,8 @@ def _attach_hd_map(frame, info, nusc_map):
 
 def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
                score_thr, max_points, host, port, lane_pred_dir=None,
-               lane_score_thr=0.3, dataroot='data/nuscenes', hd_map=True):
+               lane_score_thr=0.3, dataroot='data/nuscenes', hd_map=True,
+               occ_dir=None):
     """Infer a full scene, then play it under Foxglove's timeline controls."""
     with open(infos_path, 'rb') as f:
         data_list = pickle.load(f)['data_list']
@@ -753,6 +796,10 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         infos_path, config, checkpoint)
     sensors = _SensorCache()
     points = PointCloudChannel('/lidar')
+    color_points = PointCloudChannel('/lidar_color')
+    occ_dir = _resolve_occ_dir(occ_dir)
+    occupancy = PointCloudChannel('/occupancy') if occ_dir else None
+    attach_occ = _occupancy_attach() if occupancy is not None else None
     detections = SceneUpdateChannel('/detections')
     track_channel = SceneUpdateChannel('/tracks')
     ground_truth = SceneUpdateChannel('/ground_truth')
@@ -783,6 +830,16 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
     print('elevation so each bin shows how far the ground rises.', flush=True)
     print('Image panels: ' + ', '.join(f'/{name}' for name in camera_names),
           flush=True)
+    print('/lidar is the gray sweep. Enable /lidar_color for camera RGB.',
+          flush=True)
+    if occupancy is not None:
+        matched = sum(
+            os.path.isfile(os.path.join(
+                occ_dir, (info.get('token') or '') + '.npz'))
+            for _, info, _ in rows)
+        print(f'SparseOcc occupancy from {occ_dir}: {matched}/{len(rows)} '
+              f'frames on /occupancy (occupied voxels only).',
+              flush=True)
     lane_root = os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', '..', 'LaneMapping'))
     if lane_root not in sys.path:
@@ -820,6 +877,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         frame = build_playback_frame(
             model, dataset, class_names, info, index, sweeps_num, score_thr,
             max_points, sensors, tracker=tracker)
+        if occupancy is not None:
+            _attach_occupancy(frame, info, occ_dir, attach_occ)
         if lane_hold is not None:
             _attach_lanes(frame, info, lane_index, lane_hold, lane_score_thr,
                           make_lane_map, make_lane_graph)
@@ -831,11 +890,15 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
             present = [f'{name} {count}' for name, count
                        in frame['hd_counts'].items() if count]
             hd_note = ' | hd ' + ', '.join(present)
+        occ_note = ''
+        if frame.get('occupancy_count'):
+            occ_note = f', {frame["occupancy_count"]} occ'
         print(f'[{number}/{len(rows)}] {name} {frame["points"]:,} pts, '
               f'{frame["predictions"]} pred, {frame["track_count"]} tracks, '
               f'{frame["ground_truth_count"]} GT, '
               f'grid {frame["elevation_ms"]:.0f} ms, '
-              f'{time.perf_counter() - started:.1f}s{hd_note}', flush=True)
+              f'{time.perf_counter() - started:.1f}s{occ_note}{hd_note}',
+              flush=True)
     sensors.release_points()
 
     with lock:
@@ -863,7 +926,8 @@ def play_scene(lidar_name, infos_path, sweeps_num, config, checkpoint,
         if index != published or now - last_pub >= 0.5:
             _publish_frame(
                 points, detections, track_channel, ground_truth, ego_vehicle,
-                camera_channels, elevation_channels, frame, lane_channels)
+                camera_channels, elevation_channels, frame, lane_channels,
+                color_points, occupancy)
             server.broadcast_time(current)
             published = player.index
             last_pub = now
@@ -1470,8 +1534,9 @@ def _jpeg_messages(pairs):
 
 
 def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
-          cameras=None, ego_scene=None, grids=None):
+          cameras=None, ego_scene=None, grids=None, color_cloud=None):
     points = PointCloudChannel('/lidar')
+    color_points = PointCloudChannel('/lidar_color') if color_cloud else None
     detections = SceneUpdateChannel('/detections')
     ground_truth = SceneUpdateChannel('/ground_truth')
     ego_vehicle = SceneUpdateChannel('/ego_vehicle')
@@ -1486,6 +1551,8 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
 
     def _log_once():
         points.log(pointcloud)
+        if color_points is not None:
+            color_points.log(color_cloud)
         detections.log(scene)
         ground_truth.log(gt_scene)
         ego_vehicle.log(ego_scene)
@@ -1507,6 +1574,8 @@ def serve(pointcloud, scene, host, port, gt_scene=None, once=False,
     print('Choose Open connection -> Foxglove WebSocket ->', url, flush=True)
     print('Add a 3D panel, set its display frame to "lidar",', flush=True)
     print('and enable /lidar, /detections, /ground_truth, and /ego_vehicle.',
+          flush=True)
+    print('/lidar is gray. Enable /lidar_color for the camera-colored cloud.',
           flush=True)
     print('Elevation heatmaps sit on the road: /elevation/ground,', flush=True)
     print('/elevation/slope, /elevation/obstacle. Set Elevation field to',
@@ -1561,6 +1630,10 @@ def parse_args():
         '--play-scene', action='store_true',
         help='infer every keyframe in this log, then replay it in order')
     parser.add_argument(
+        '--occ-dir',
+        default='demo/eval_out/occupancy/lidar',
+        help='saved SparseOcc LiDAR-frame npz files; a missing directory skips occupancy')
+    parser.add_argument(
         '--no-hd-map', action='store_true',
         help='do not draw the nuScenes map expansion on /hd_map')
     parser.add_argument(
@@ -1576,7 +1649,7 @@ def main():
             os.path.basename(args.pcd), args.infos, args.sweeps, args.config,
             args.checkpoint, args.score_thr, args.max_points, args.host,
             args.port, args.lane_preds, args.lane_score_thr,
-            hd_map=not args.no_hd_map)
+            hd_map=not args.no_hd_map, occ_dir=args.occ_dir)
         return
     gt_boxes = []
     cameras = {}
@@ -1589,10 +1662,12 @@ def main():
             args.pcd, args.detections, args.ann, args.img_dir, args.max_points)
     key_xyz = load_lidar_xyz(_existing_lidar_path(args.pcd))
     grids = make_elevation_grids(estimate_elevation_grid(key_xyz))
+    gray = np.repeat(
+        np.asarray(DEFAULT_LIDAR_RGB, dtype=np.uint8)[None], len(xyz), axis=0)
     serve(
-        make_pointcloud(xyz, rgb), make_scene(boxes), args.host, args.port,
+        make_pointcloud(xyz, gray), make_scene(boxes), args.host, args.port,
         gt_scene=make_gt_scene(gt_boxes), once=args.once, cameras=cameras,
-        grids=grids)
+        grids=grids, color_cloud=make_pointcloud(xyz, rgb))
 
 
 if __name__ == '__main__':

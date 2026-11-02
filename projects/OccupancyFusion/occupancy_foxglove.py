@@ -93,6 +93,19 @@ def occupancy_cloud(npz_path):
     return make_pointcloud(xyz, rgb), len(xyz)
 
 
+def attach_occupancy(frame, token, occ_dir):
+    """Load a LiDAR-frame occupancy npz into ``frame`` if that sample exists."""
+    if not token or not occ_dir:
+        return False
+    path = osp.join(occ_dir, token + '.npz')
+    if not osp.isfile(path):
+        return False
+    cloud, count = occupancy_cloud(path)
+    frame['occupancy'] = cloud
+    frame['occupancy_count'] = count
+    return True
+
+
 def lidar_cloud(path):
     pts = np.fromfile(path, dtype=np.float32).reshape(-1, 5)[:, :3]
     pts = pts[np.linalg.norm(pts[:, :2], axis=1) < 40]
